@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""AgenticOS workflow viewer + workflow memory logger."""
+
+import argparse
+import datetime as dt
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+VENV_PY = ROOT / ".venv" / "bin" / "python"
+
+if not os.environ.get("VIRTUAL_ENV") and VENV_PY.exists() and Path(sys.executable) != VENV_PY:
+    os.execv(str(VENV_PY), [str(VENV_PY)] + sys.argv)
+
+try:
+    import yaml  # type: ignore
+except ImportError:
+    sys.stderr.write("PyYAML is required. Run ./install.sh or pip install pyyaml.\n")
+    sys.exit(1)
+
+
+# =============================================================================
+# Phase 4: Project-Aware Workflow Paths
+# =============================================================================
+# Read project context from environment (set by router) to support project workflows
+
+def get_project_context() -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Read project context from environment variables set by router.
+
+    Returns:
+        Tuple of (project_root, agents_dir) or (None, None) if not in project mode
+    """
+    project_root_str = os.environ.get("AGENTICOS_PROJECT_ROOT")
+    agents_dir_str = os.environ.get("AGENTICOS_PROJECT_AGENTS")
+
+    if project_root_str and agents_dir_str:
+        project_root = Path(project_root_str)
+        agents_dir = Path(agents_dir_str)
+        if project_root.exists() and agents_dir.exists():
+            return project_root, agents_dir
+
+    return None, None
+
+
+# Detect project context at module load
+PROJECT_ROOT, PROJECT_AGENTS_DIR = get_project_context()
+
+# Determine effective paths based on project context
+if PROJECT_AGENTS_DIR is not None:
+    # Project mode: use project-specific paths
+    EFFECTIVE_ROOT = PROJECT_ROOT
+    EFFECTIVE_AGENTS_DIR = PROJECT_AGENTS_DIR
+else:
+    # Default mode: use AgenticOS paths
+    EFFECTIVE_ROOT = ROOT
+    EFFECTIVE_AGENTS_DIR = ROOT / ".agents"
+
+WORKFLOWS_FILE = EFFECTIVE_AGENTS_DIR / "workflows.yaml"
+AGENTS_FILE = EFFECTIVE_AGENTS_DIR / "agents.yaml"
+MEMORY_ROOT = EFFECTIVE_AGENTS_DIR / "memory"
+WORKFLOW_MEMORY = MEMORY_ROOT / "workflows"
+
+WORKFLOW_MEMORY.mkdir(parents=True, exist_ok=True)
+
+
+def load_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing config: {path}")
+    with path.open("r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def print_workflow(name: str, workflows: Dict[str, Any], agents: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]]]:
+    wf = workflows.get("workflows", {}).get(name)
+    if not wf:
+        raise KeyError(f"Workflow '{name}' not found in {WORKFLOWS_FILE}")
+
+    profiles = agents.get("profiles", {})
+
+    print(f"Workflow: {name}")
+    if desc := wf.get("description"):
+        print(f"Description: {desc}")
+    print("Steps:")
+    steps = wf.get("steps", [])
+    if not steps:
+        print("  (no steps defined)")
+        return name, []
+    for idx, step in enumerate(steps, start=1):
+        s_name = step.get("name", f"step{idx}")
+        profile = step.get("profile", "unknown")
+        profile_cfg = profiles.get(profile, {}) if agents else {}
+        provider = profile_cfg.get("provider", "n/a")
+        cmd = profile_cfg.get("command", "")
+        print(f"  {idx}. {s_name}")
+        print(f"     profile: {profile}")
+        print(f"     provider: {provider}")
+        if cmd:
+            print(f"     command template: {cmd}")
+    return name, steps
+
+
+def list_workflows(workflows: Dict[str, Any]) -> None:
+    names = sorted(workflows.get("workflows", {}).keys())
+    if not names:
+        print("No workflows defined.")
+        return
+    print("Available workflows:")
+    for name in names:
+        print(f"- {name}")
+
+
+def parse_last_entry(text: str) -> Dict[str, Any]:
+    if not text:
+        return {}
+    blocks = [b for b in text.split("\n## ") if b.strip()]
+    if not blocks:
+        return {}
+    last_block = "## " + blocks[-1]
+    lines = last_block.splitlines()
+    summary = ""
+    artifacts: List[str] = []
+    next_actions: List[str] = []
+    for idx, line in enumerate(lines):
+        line_lower = line.lower()
+        if line_lower.startswith("- summary:"):
+            summary = line.split(":", 1)[1].strip()
+        if line_lower.startswith("- artifacts:"):
+            artifacts = [ln.strip() for ln in lines[idx + 1 :] if ln.strip().startswith("- ")]
+        if line_lower.startswith("- next actions:"):
+            next_actions = [ln.strip() for ln in lines[idx + 1 :] if ln.strip().startswith("- ")]
+    return {"summary": summary, "artifacts": artifacts, "next_actions": next_actions}
+
+
+def compute_delta(previous: Dict[str, Any], summary: str, next_actions: List[str], artifacts: List[str]) -> List[str]:
+    if not previous:
+        return ["- First recorded workflow run."]
+    delta: List[str] = []
+    if summary and summary != previous.get("summary"):
+        delta.append("- Summary updated.")
+    if next_actions and next_actions != previous.get("next_actions"):
+        delta.append("- Next actions refreshed.")
+    if artifacts and artifacts != previous.get("artifacts"):
+        delta.append("- Artifacts updated.")
+    if not delta:
+        delta.append("- No major changes detected.")
+    return delta[:4]
+
+
+def append_workflow_memory(
+    name: str,
+    summary: str,
+    next_actions: List[str],
+    artifacts: List[str],
+    tags: List[str],
+) -> None:
+    path = WORKFLOW_MEMORY / f"{name}.md"
+    prev_data = parse_last_entry(path.read_text(encoding="utf-8")) if path.exists() else {}
+    delta_lines = compute_delta(prev_data, summary, next_actions, artifacts)
+    now = dt.datetime.now(dt.UTC).isoformat() + "Z"
+    tags_text = ", ".join(tags) if tags else "(none)"
+    entry_lines = [
+        f"## {now}",
+        f"- Tags: {tags_text}",
+        f"- Summary: {summary or '(none)'}",
+        "- Artifacts:",
+        *(artifacts or ["- (none)"]),
+        "- Next actions:",
+        *(next_actions or ["- (none)"]),
+        "- Delta:",
+        *(delta_lines or ["- (none)"]),
+        "",
+    ]
+    try:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(entry_lines))
+    except Exception:
+        pass
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="AgenticOS workflow viewer")
+    parser.add_argument("workflow", nargs="?", help="Workflow name to display")
+    parser.add_argument("--list", action="store_true", dest="list_only", help="List all workflows")
+    parser.add_argument("--summary", help="Custom summary to log for this workflow run")
+    parser.add_argument(
+        "--next-actions",
+        help="Comma-separated next actions to store for this workflow run (default: derived from steps)",
+    )
+    parser.add_argument(
+        "--artifacts",
+        help="Comma-separated artifacts touched for this workflow run (default: none)",
+    )
+    parser.add_argument(
+        "--tag",
+        help="Comma-separated tags to attach to this workflow memory entry",
+    )
+    args = parser.parse_args()
+
+    tags = [t.strip() for t in (args.tag.split(",") if args.tag else []) if t.strip()]
+
+    try:
+        workflows = load_yaml(WORKFLOWS_FILE)
+        agents = load_yaml(AGENTS_FILE)
+    except Exception as exc:  # pylint: disable=broad-except
+        sys.stderr.write(f"ERROR: {exc}\n")
+        return 1
+
+    if args.list_only or not args.workflow:
+        list_workflows(workflows)
+        if args.workflow:
+            print("")
+            try:
+                print_workflow(args.workflow, workflows, agents)
+            except Exception as exc:  # pylint: disable=broad-except
+                sys.stderr.write(f"ERROR: {exc}\n")
+                return 1
+        return 0
+
+    try:
+        wf_name, steps = print_workflow(args.workflow, workflows, agents)
+        if steps is None:
+            steps = []
+
+        # Create workflow memory entry
+        summary = args.summary or f"Workflow '{args.workflow}' viewed with {len(steps)} steps."
+        artifacts = [f"- {a.strip()}" for a in args.artifacts.split(",") if a.strip()] if args.artifacts else []
+        next_actions = (
+            [f"- {a.strip()}" for a in args.next_actions.split(",") if a.strip()]
+            if args.next_actions
+            else [f"- Execute step {idx + 1}: {step.get('name', f'step{idx+1}')}" for idx, step in enumerate(steps)]
+        )
+
+        # Write to workflow memory file
+        append_workflow_memory(args.workflow, summary, next_actions, artifacts, tags)
+
+        # Signal to user how to run with context
+        print("\nTo run with workflow context:")
+        for idx, step in enumerate(steps, 1):
+            step_name = step.get('name', f'step{idx}')
+            profile = step.get('profile', 'unknown')
+            print(f"  Step {idx}: WORKFLOW={args.workflow} WORKFLOW_STEP={step_name} ./scripts/agent {profile}")
+    except Exception as exc:  # pylint: disable=broad-except
+        sys.stderr.write(f"ERROR: {exc}\n")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

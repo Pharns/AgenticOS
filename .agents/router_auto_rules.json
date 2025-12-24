@@ -1,0 +1,86 @@
+{
+  "version": "1.0.0",
+  "description": "AgenticOS router auto-routing rules. Rules are evaluated in order; first match wins. Tokens are extracted from free text and matched against match_all (required) and match_any (optional) lists using literal lowercase token matching.",
+  "rules": [
+    {
+      "id": "bug_fix_workflow",
+      "description": "Route bug fixes to the auto_fix_bug workflow",
+      "match_all": ["bug"],
+      "match_any": ["fix", "broken", "error", "issue", "crash"],
+      "route": {
+        "type": "workflow",
+        "target": "auto_fix_bug"
+      }
+    },
+    {
+      "id": "ops_diagnostics_workflow",
+      "description": "Route operational diagnostics to ops_check workflow",
+      "match_all": ["ops"],
+      "match_any": ["diagnostic", "health", "check", "status", "logs"],
+      "route": {
+        "type": "workflow",
+        "target": "ops_check"
+      }
+    },
+    {
+      "id": "grc_policy",
+      "description": "Route security policy and compliance writing to grc",
+      "match_all": [],
+      "match_any": ["policy", "compliance", "audit", "regulation", "framework", "nist", "iso", "soc2", "hipaa", "gdpr"],
+      "route": {
+        "type": "profile",
+        "target": "grc"
+      }
+    },
+    {
+      "id": "dev_coding",
+      "description": "Route coding tasks to dev profile",
+      "match_all": [],
+      "match_any": ["implement", "refactor", "function", "class", "api", "endpoint", "test", "unittest"],
+      "route": {
+        "type": "profile",
+        "target": "dev"
+      }
+    },
+    {
+      "id": "dev_fix",
+      "description": "Route fix/build tasks to dev profile",
+      "match_all": [],
+      "match_any": ["fix", "broken", "error", "crash", "build", "compile", "deploy"],
+      "route": {
+        "type": "profile",
+        "target": "dev"
+      }
+    },
+    {
+      "id": "research_analysis",
+      "description": "Route research and analysis tasks to research profile",
+      "match_all": [],
+      "match_any": ["research", "analyze", "investigate", "explore", "compare", "study", "evaluate"],
+      "route": {
+        "type": "profile",
+        "target": "research"
+      }
+    },
+    {
+      "id": "ops_debug",
+      "description": "Route ops/debug tasks to ops profile",
+      "match_all": [],
+      "match_any": ["debug", "troubleshoot", "diagnose", "logs", "monitor", "performance"],
+      "route": {
+        "type": "profile",
+        "target": "ops"
+      }
+    },
+    {
+      "id": "quick_questions",
+      "description": "Route simple questions to quick profile",
+      "match_all": [],
+      "match_any": ["what", "how", "why", "explain", "define", "describe", "list", "name"],
+      "route": {
+        "type": "profile",
+        "target": "quick"
+      }
+    }
+  ]
+}

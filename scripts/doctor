@@ -1,0 +1,1046 @@
+#!/usr/bin/env python3
+"""AgenticOS offline health check."""
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+VENV_PY = ROOT / ".venv" / "bin" / "python"
+
+# Auto-switch into the AgenticOS venv if it exists and we're not already in it
+if not os.environ.get("VIRTUAL_ENV") and VENV_PY.exists() and Path(sys.executable) != VENV_PY:
+    os.execv(str(VENV_PY), [str(VENV_PY)] + sys.argv)
+
+try:
+    import yaml  # type: ignore
+except ImportError:
+    sys.stderr.write("PyYAML is required. Run ./install.sh\n")
+    sys.exit(2)
+
+
+AGENTS_FILE = ROOT / ".agents" / "agents.yaml"
+WORKFLOWS_FILE = ROOT / ".agents" / "workflows.yaml"
+RULES_FILE = ROOT / ".agents" / "router_auto_rules.json"
+LOG_SCHEMA_FILE = ROOT / ".agents" / "schemas" / "log_v1.json"
+LOG_DIR = ROOT / ".agents" / "logs"
+LOG_ARCHIVE_DIR = LOG_DIR / "archive"
+MEMORY_ROOT = ROOT / ".agents" / "memory"
+MEMORY_PROFILES = MEMORY_ROOT / "profiles"
+MEMORY_SESSIONS = MEMORY_ROOT / "sessions"
+MEMORY_WORKFLOWS = MEMORY_ROOT / "workflows"
+SUMMARY_FILE = MEMORY_ROOT / "summary.md"
+
+
+def rotate_logs(days: int = 30) -> Tuple[int, int]:
+    """
+    Archive logs older than N days.
+
+    Args:
+        days: Number of days to keep logs (default 30)
+
+    Returns:
+        Tuple of (archived_count, error_count)
+    """
+    import datetime as dt
+    import shutil
+
+    if not LOG_DIR.exists():
+        return 0, 0
+
+    # Create archive directory
+    LOG_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+    cutoff = dt.datetime.now(dt.UTC) - dt.timedelta(days=days)
+    archived = 0
+    errors = 0
+
+    for log_file in LOG_DIR.glob("*.json"):
+        try:
+            # Parse timestamp from filename (format: YYYY-MM-DDTHH-MM-SSZ-profile.json)
+            name = log_file.name
+            if name.startswith("router-"):
+                # Format: router-YYYY-MM-DDTHH-MM-SSZ-...
+                ts_part = name.split("-", 1)[1][:20].replace("-", ":")[:19]
+            else:
+                # Format: YYYY-MM-DDTHH-MM-SSZ-...
+                ts_part = name[:20].replace("-", ":")[:19]
+
+            # Try parsing the timestamp
+            try:
+                # Handle format: 2025-12-23T23:15:02Z
+                file_ts = dt.datetime.fromisoformat(ts_part.rstrip("Z").replace(":", "-", 2).replace("-", ":", 2)[:19])
+                file_ts = file_ts.replace(tzinfo=dt.UTC)
+            except ValueError:
+                # Can't parse timestamp, skip
+                continue
+
+            if file_ts < cutoff:
+                # Move to archive
+                dest = LOG_ARCHIVE_DIR / log_file.name
+                shutil.move(str(log_file), str(dest))
+                archived += 1
+        except Exception:  # noqa: BLE001
+            errors += 1
+
+    return archived, errors
+
+
+Status = str  # "ok" | "warn" | "fail"
+
+
+def add_check(results: List[Dict[str, Any]], name: str, status: Status, details: str, hint: str = "") -> None:
+    results.append({"name": name, "status": status, "details": details, "hint": hint})
+
+
+def safe_make_dir(path: Path, root: Path, actions: List[str]) -> bool:
+    if not str(path.resolve()).startswith(str(root.resolve())):
+        actions.append(f"skip make dir outside root: {path}")
+        return False
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        actions.append(f"ensure dir: {path}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        actions.append(f"failed to ensure dir {path}: {exc}")
+        return False
+
+
+def safe_chmod_x(path: Path, actions: List[str]) -> bool:
+    if not path.exists():
+        actions.append(f"skip chmod missing: {path}")
+        return False
+    if not str(path.resolve()).startswith(str(ROOT.resolve())):
+        actions.append(f"skip chmod outside root: {path}")
+        return False
+    try:
+        mode = path.stat().st_mode
+        if mode & 0o111:
+            actions.append(f"chmod not needed (already exec): {path}")
+            return False
+        path.chmod(mode | 0o755)
+        actions.append(f"chmod +x: {path}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        actions.append(f"failed chmod {path}: {exc}")
+        return False
+
+
+def check_agents_file(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    if not AGENTS_FILE.exists():
+        add_check(
+            results,
+            "agents.yaml exists",
+            "fail",
+            f"Missing: {AGENTS_FILE}",
+            hint="Restore .agents/agents.yaml from repo or backup.",
+        )
+        return data
+    if not os.access(AGENTS_FILE, os.R_OK):
+        add_check(
+            results,
+            "agents.yaml readable",
+            "fail",
+            f"Not readable: {AGENTS_FILE}",
+            hint="Fix permissions: chmod +r .agents/agents.yaml",
+        )
+        return data
+    try:
+        with AGENTS_FILE.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        add_check(results, "agents.yaml parse", "ok", "Loaded successfully")
+    except Exception as exc:  # noqa: BLE001
+        add_check(
+            results,
+            "agents.yaml parse",
+            "fail",
+            f"Parse error: {exc}",
+            hint="Fix YAML syntax in .agents/agents.yaml",
+        )
+    return data
+
+
+def check_workflows_file(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    if not WORKFLOWS_FILE.exists():
+        add_check(
+            results,
+            "workflows.yaml exists",
+            "warn",
+            f"Missing: {WORKFLOWS_FILE}",
+            hint="Optional: define workflows in .agents/workflows.yaml",
+        )
+        return data
+    if not os.access(WORKFLOWS_FILE, os.R_OK):
+        add_check(
+            results,
+            "workflows.yaml readable",
+            "fail",
+            f"Not readable: {WORKFLOWS_FILE}",
+            hint="Fix permissions: chmod +r .agents/workflows.yaml",
+        )
+        return data
+    try:
+        with WORKFLOWS_FILE.open("r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        add_check(results, "workflows.yaml parse", "ok", "Loaded successfully")
+    except Exception as exc:  # noqa: BLE001
+        add_check(
+            results,
+            "workflows.yaml parse",
+            "fail",
+            f"Parse error: {exc}",
+            hint="Fix YAML syntax in .agents/workflows.yaml",
+        )
+    return data
+
+
+def check_profile(
+    results: List[Dict[str, Any]],
+    profile_name: str,
+    cfg: Dict[str, Any],
+) -> None:
+    prompt_rel = cfg.get("prompt")
+    cmd_tpl = cfg.get("command")
+    provider = cfg.get("provider", "unknown")
+    memory_rel = cfg.get("memory_file")
+
+    if not prompt_rel:
+        add_check(
+            results,
+            f"profile:{profile_name}:prompt",
+            "fail",
+            "Missing prompt path",
+            hint="Set 'prompt' in .agents/agents.yaml for this profile.",
+        )
+    else:
+        prompt_path = (ROOT / prompt_rel).resolve()
+        if prompt_path.exists() and os.access(prompt_path, os.R_OK):
+            add_check(results, f"profile:{profile_name}:prompt", "ok", f"Prompt found: {prompt_path}")
+        else:
+            hint = f"Restore prompt file or fix path: {prompt_path}"
+            add_check(results, f"profile:{profile_name}:prompt", "fail", f"Prompt missing/unreadable: {prompt_path}", hint=hint)
+
+    if not cmd_tpl:
+        add_check(
+            results,
+            f"profile:{profile_name}:command",
+            "fail",
+            "Missing command template",
+            hint="Set 'command' in .agents/agents.yaml for this profile.",
+        )
+        cli = None
+    else:
+        try:
+            cmd_rendered = cmd_tpl.format(prompt="prompt", profile=profile_name, root=str(ROOT))
+            argv = shlex.split(cmd_rendered)
+            cli = argv[0] if argv else None
+            if cli:
+                add_check(results, f"profile:{profile_name}:command", "ok", f"Command template renders (provider={provider})")
+            else:
+                add_check(
+                    results,
+                    f"profile:{profile_name}:command",
+                    "warn",
+                    "Command renders empty argv",
+                    hint="Verify command template placeholders in .agents/agents.yaml",
+                )
+        except Exception as exc:  # noqa: BLE001
+            cli = None
+            add_check(
+                results,
+                f"profile:{profile_name}:command",
+                "fail",
+                f"Render error: {exc}",
+                hint="Validate command template placeholders (prompt/profile/root).",
+            )
+
+    if cli:
+        if shutil.which(cli) is not None:
+            add_check(results, f"profile:{profile_name}:cli", "ok", f"CLI found on PATH: {cli}")
+        else:
+            add_check(
+                results,
+                f"profile:{profile_name}:cli",
+                "warn",
+                f"CLI not on PATH: {cli}",
+                hint=f"Install or export PATH for CLI '{cli}' (e.g., update shell PATH).",
+            )
+
+    if memory_rel:
+        mem_path = (ROOT / memory_rel).resolve()
+        if str(mem_path).startswith(str(MEMORY_ROOT.resolve())):
+            writable = os.access(mem_path.parent, os.W_OK) if mem_path.parent.exists() else os.access(mem_path.parent, os.W_OK)
+            hint = ""
+            status: Status = "ok"
+            detail = f"Memory under {MEMORY_ROOT}"
+            if not writable:
+                status = "warn"
+                hint = f"Fix permissions for {mem_path.parent} (e.g., chmod -R u+rwX {mem_path.parent})"
+                detail = f"Memory parent not writable: {mem_path.parent}"
+            add_check(results, f"profile:{profile_name}:memory_path", status, detail, hint=hint)
+        else:
+            add_check(
+                results,
+                f"profile:{profile_name}:memory_path",
+                "warn",
+                f"Memory path outside {MEMORY_ROOT}: {mem_path}",
+                hint=f"Set memory_file under {MEMORY_ROOT} to align with AgenticOS rules.",
+            )
+    else:
+        add_check(
+            results,
+            f"profile:{profile_name}:memory_path",
+            "warn",
+            "Memory file not set (falls back to last-session)",
+            hint="Optional: set memory_file to a path under .agents/memory for this profile.",
+        )
+
+
+def check_writable(results: List[Dict[str, Any]], path: Path, name: str) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    test_file = path / ".doctor_write_test"
+    try:
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink()
+        add_check(results, f"writable:{name}", "ok", f"Writable: {path}")
+    except Exception as exc:  # noqa: BLE001
+        add_check(
+            results,
+            f"writable:{name}",
+            "fail",
+            f"Not writable: {path} ({exc})",
+            hint=f"Fix permissions/ownership for {path} (e.g., chmod -R u+rwX {path})",
+        )
+
+
+def check_summary_file(results: List[Dict[str, Any]]) -> None:
+    try:
+        SUMMARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with SUMMARY_FILE.open("a", encoding="utf-8"):
+            pass
+        add_check(results, "summary.md writable", "ok", f"Writable: {SUMMARY_FILE}")
+    except Exception as exc:  # noqa: BLE001
+        add_check(
+            results,
+            "summary.md writable",
+            "fail",
+            f"Not writable: {SUMMARY_FILE} ({exc})",
+            hint=f"Fix permissions/ownership for {SUMMARY_FILE} (e.g., chmod -R u+rwX {SUMMARY_FILE.parent})",
+        )
+
+
+def check_workflow_memory_dir(results: List[Dict[str, Any]]) -> None:
+    if not MEMORY_WORKFLOWS.exists():
+        add_check(
+            results,
+            "memory:workflows_dir",
+            "warn",
+            f"Missing workflow memory dir: {MEMORY_WORKFLOWS}",
+            hint="Create directory: mkdir -p .agents/memory/workflows",
+        )
+        return
+    if not os.access(MEMORY_WORKFLOWS, os.W_OK):
+        add_check(
+            results,
+            "memory:workflows_dir",
+            "fail",
+            f"Workflow memory not writable: {MEMORY_WORKFLOWS}",
+            hint=f"Fix permissions: chmod -R u+rwX {MEMORY_WORKFLOWS}",
+        )
+        return
+    add_check(results, "memory:workflows_dir", "ok", f"Workflow memory directory present: {MEMORY_WORKFLOWS}")
+
+
+def check_workflow_delta_logging(results: List[Dict[str, Any]]) -> None:
+    """Warn if workflows exist but recent logs don't include workflow context."""
+    log_path = latest_log_path()
+    if not log_path:
+        return  # No logs to check
+
+    try:
+        with log_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        has_workflow = data.get("workflow_name") is not None
+        has_delta_field = "workflow_context_injected" in data
+
+        if has_delta_field and has_workflow:
+            add_check(
+                results,
+                "workflow:delta_logging",
+                "ok",
+                f"Workflow delta logging active (workflow={data['workflow_name']})"
+            )
+        else:
+            add_check(
+                results,
+                "workflow:delta_logging",
+                "ok",
+                "Latest log not a workflow run (no workflow context present)"
+            )
+    except Exception as exc:
+        add_check(
+            results,
+            "workflow:delta_logging",
+            "warn",
+            f"Could not validate workflow delta logging: {exc}",
+            hint="Check JSON log structure in .agents/logs/"
+        )
+
+
+def check_router_auto_rules(results: List[Dict[str, Any]]) -> None:
+    """Validate router auto rules JSON file."""
+    if not RULES_FILE.exists():
+        add_check(
+            results,
+            "router_auto_rules",
+            "warn",
+            f"Rules file missing: {RULES_FILE}",
+            hint="Optional: create .agents/router_auto_rules.json for auto-routing rules"
+        )
+        return
+
+    try:
+        with RULES_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:
+        add_check(
+            results,
+            "router_auto_rules",
+            "fail",
+            f"Invalid JSON in {RULES_FILE}: {exc}",
+            hint="Fix JSON syntax in .agents/router_auto_rules.json"
+        )
+        return
+    except Exception as exc:
+        add_check(
+            results,
+            "router_auto_rules",
+            "fail",
+            f"Cannot read {RULES_FILE}: {exc}",
+            hint="Check file permissions for .agents/router_auto_rules.json"
+        )
+        return
+
+    # Validate schema
+    if "version" not in data:
+        add_check(
+            results,
+            "router_auto_rules:version",
+            "warn",
+            "Missing 'version' field in rules file",
+            hint="Add 'version' field to .agents/router_auto_rules.json"
+        )
+
+    if "rules" not in data:
+        add_check(
+            results,
+            "router_auto_rules:rules",
+            "fail",
+            "Missing 'rules' array in rules file",
+            hint="Add 'rules' array to .agents/router_auto_rules.json"
+        )
+        return
+
+    rules = data.get("rules", [])
+    if not isinstance(rules, list):
+        add_check(
+            results,
+            "router_auto_rules:rules",
+            "fail",
+            "'rules' must be an array",
+            hint="Ensure 'rules' is a JSON array in .agents/router_auto_rules.json"
+        )
+        return
+
+    # Validate each rule
+    rule_ids = []
+    for idx, rule in enumerate(rules, 1):
+        if not isinstance(rule, dict):
+            add_check(
+                results,
+                f"router_auto_rules:rule_{idx}",
+                "fail",
+                f"Rule {idx} is not an object",
+                hint=f"Ensure rule {idx} is a JSON object"
+            )
+            continue
+
+        rule_id = rule.get("id", f"rule_{idx}")
+        rule_ids.append(rule_id)
+
+        # Check required keys
+        if "match_all" not in rule:
+            add_check(
+                results,
+                f"router_auto_rules:{rule_id}:match_all",
+                "fail",
+                f"Rule '{rule_id}' missing required 'match_all' field",
+                hint=f"Add 'match_all' array to rule '{rule_id}'"
+            )
+            continue
+
+        match_all = rule.get("match_all")
+        if not isinstance(match_all, list):
+            add_check(
+                results,
+                f"router_auto_rules:{rule_id}:match_all",
+                "fail",
+                f"Rule '{rule_id}' match_all must be an array",
+                hint=f"Ensure match_all is a JSON array in rule '{rule_id}'"
+            )
+            continue
+
+        if len(match_all) == 0:
+            add_check(
+                results,
+                f"router_auto_rules:{rule_id}:match_all",
+                "fail",
+                f"Rule '{rule_id}' match_all cannot be empty",
+                hint=f"Add at least one token to match_all in rule '{rule_id}'"
+            )
+            continue
+
+        # Check optional match_any
+        if "match_any" in rule:
+            match_any = rule.get("match_any")
+            if not isinstance(match_any, list):
+                add_check(
+                    results,
+                    f"router_auto_rules:{rule_id}:match_any",
+                    "fail",
+                    f"Rule '{rule_id}' match_any must be an array",
+                    hint=f"Ensure match_any is a JSON array in rule '{rule_id}'"
+                )
+                continue
+
+        # Check route
+        if "route" not in rule:
+            add_check(
+                results,
+                f"router_auto_rules:{rule_id}:route",
+                "fail",
+                f"Rule '{rule_id}' missing required 'route' field",
+                hint=f"Add 'route' object to rule '{rule_id}'"
+            )
+            continue
+
+        route = rule.get("route")
+        if not isinstance(route, dict):
+            add_check(
+                results,
+                f"router_auto_rules:{rule_id}:route",
+                "fail",
+                f"Rule '{rule_id}' route must be an object",
+                hint=f"Ensure route is a JSON object in rule '{rule_id}'"
+            )
+            continue
+
+        route_type = route.get("type")
+        if route_type not in ["workflow", "profile"]:
+            add_check(
+                results,
+                f"router_auto_rules:{rule_id}:route:type",
+                "fail",
+                f"Rule '{rule_id}' route.type must be 'workflow' or 'profile', got: {route_type!r}",
+                hint=f"Set route.type to 'workflow' or 'profile' in rule '{rule_id}'"
+            )
+            continue
+
+        if "target" not in route:
+            add_check(
+                results,
+                f"router_auto_rules:{rule_id}:route:target",
+                "fail",
+                f"Rule '{rule_id}' route missing 'target' field",
+                hint=f"Add route.target to rule '{rule_id}'"
+            )
+            continue
+
+    # Check for duplicate rule IDs
+    if len(rule_ids) != len(set(rule_ids)):
+        duplicates = [rid for rid in rule_ids if rule_ids.count(rid) > 1]
+        add_check(
+            results,
+            "router_auto_rules:unique_ids",
+            "fail",
+            f"Duplicate rule IDs found: {list(set(duplicates))}",
+            hint="Ensure all rule IDs are unique in .agents/router_auto_rules.json"
+        )
+        return
+
+    # If we got here, all rules are valid
+    add_check(
+        results,
+        "router_auto_rules",
+        "ok",
+        f"Rules file valid: {len(rules)} rules with unique IDs"
+    )
+
+
+def latest_log_path() -> Optional[Path]:
+    try:
+        if not LOG_DIR.exists():
+            return None
+        logs = sorted(LOG_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return logs[0] if logs else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def validate_log_with_schema(
+    log_data: Dict[str, Any],
+    results: List[Dict[str, Any]],
+    schema_override: Dict[str, Any] | None = None,
+) -> bool:
+    """
+    Validate log data against JSON Schema if available.
+    Returns True if validation passes or schema validation not available.
+    """
+    if schema_override is None and not LOG_SCHEMA_FILE.exists():
+        add_check(
+            results,
+            "logs:schema_file",
+            "warn",
+            f"Schema file not found: {LOG_SCHEMA_FILE}",
+            hint="Create .agents/schemas/log_v1.json for schema validation"
+        )
+        return True  # Don't fail if schema file missing
+
+    try:
+        # Try to import jsonschema (optional dependency)
+        import jsonschema  # type: ignore
+    except ImportError:
+        add_check(
+            results,
+            "logs:jsonschema",
+            "ok",
+            "jsonschema library not available; skipped schema validation",
+            hint="Optional: pip install jsonschema (e.g., .venv/bin/pip install jsonschema)"
+        )
+        return True  # Don't fail if jsonschema not available
+
+    if schema_override is not None:
+        schema = schema_override
+    else:
+        try:
+            with LOG_SCHEMA_FILE.open("r", encoding="utf-8") as fh:
+                schema = json.load(fh)
+        except Exception as exc:  # noqa: BLE001
+            add_check(
+                results,
+                "logs:schema_load",
+                "fail",
+                f"Failed to load schema: {exc}",
+                hint=f"Check JSON syntax in {LOG_SCHEMA_FILE}"
+            )
+            return False
+
+    try:
+        jsonschema.validate(instance=log_data, schema=schema)
+        add_check(
+            results,
+            "logs:schema_validation",
+            "ok",
+            "Latest log validates against schema"
+        )
+        return True
+    except jsonschema.ValidationError as exc:  # noqa: BLE001
+        # Schema validation failed - this is a warn, not a fail (backward compatibility)
+        add_check(
+            results,
+            "logs:schema_validation",
+            "warn",
+            f"Log doesn't match schema: {exc.message}",
+            hint="Check log structure matches .agents/schemas/log_v1.json"
+        )
+        return False
+    except Exception as exc:  # noqa: BLE001
+        add_check(
+            results,
+            "logs:schema_validation",
+            "warn",
+            f"Schema validation error: {exc}",
+            hint="Check both log and schema are valid JSON"
+        )
+        return False
+
+
+def check_log_schema(results: List[Dict[str, Any]]) -> None:
+    required_agent = {"stdout_norm", "stderr_norm", "provider_meta", "normalization_notes"}
+    optional_agent = {"sections", "next_actions", "delta", "delta_sources", "tags", "run_id"}
+    required_router = {"router_action", "target_type", "target_name", "argv", "exit_code", "duration_ms", "run_id"}
+    optional_router = {"log_file", "log_path"}
+    log_path = latest_log_path()
+    if not log_path:
+        add_check(
+            results,
+            "logs:latest",
+            "warn",
+            "No JSON logs found",
+            hint="Run ./scripts/agent <profile> to generate a log entry.",
+        )
+        return
+    try:
+        with log_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        # Decide log type
+        is_router = bool(data.get("router_action")) or log_path.name.endswith("-router-auto.json")
+        is_workflow_exec = data.get("log_type") == "workflow_execution" or "-workflow-" in log_path.name
+        schema_agent = {
+            "type": "object",
+            "required": sorted(required_agent),
+            "additionalProperties": True,
+        }
+        schema_router = {
+            "type": "object",
+            "required": sorted(required_router),
+            "additionalProperties": True,
+        }
+        # Phase 7: Add required fields for workflow execution logs
+        required_workflow = {"workflow", "run_id", "steps_total", "steps_run", "succeeded", "failed", "results"}
+
+        if is_workflow_exec:
+            schema_use = {
+                "type": "object",
+                "required": sorted(required_workflow),
+                "additionalProperties": True,
+            }
+        elif is_router:
+            schema_use = schema_router
+        else:
+            schema_use = schema_agent
+
+        # Validate against JSON Schema if available (type-specific)
+        validate_log_with_schema(data, results, schema_override=schema_use)
+
+        if is_workflow_exec:
+            missing = [k for k in required_workflow if k not in data]
+            status: Status = "ok" if not missing else "fail"
+            hint = "Ensure scripts/router execute_workflow writes workflow execution fields."
+            details = f"Latest log (workflow): {log_path.name}"
+            if missing:
+                details += f" | missing keys: {', '.join(missing)}"
+            else:
+                details += f" | {data.get('succeeded', 0)} succeeded, {data.get('failed', 0)} failed"
+            add_check(results, "logs:workflow_exec", status, details, hint=hint)
+        elif is_router:
+            missing = [k for k in required_router if k not in data]
+            missing_opt = [k for k in optional_router if k not in data]
+            status: Status = "ok" if not missing else "fail"
+            hint = "Ensure scripts/router writes router_action/target_type/target_name/argv/exit_code/duration_ms/run_id."
+            details = f"Latest log (router): {log_path.name}"
+            if missing:
+                details += f" | missing keys: {', '.join(missing)}"
+            elif missing_opt:
+                details += f" | optional keys missing: {', '.join(missing_opt)}"
+            add_check(results, "logs:router_fields", status, details, hint=hint)
+        else:
+            missing = [k for k in required_agent if k not in data]
+            missing_opt = [k for k in optional_agent if k not in data]
+            status: Status = "ok" if not missing else "fail"
+            hint = "Ensure scripts/agent writes normalized fields (stdout_norm/stderr_norm/provider_meta/normalization_notes)."
+            details = f"Latest log (agent): {log_path.name}"
+            if missing:
+                details += f" | missing keys: {', '.join(missing)}"
+            elif missing_opt:
+                details += f" | optional keys missing: {', '.join(missing_opt)}"
+            add_check(results, "logs:basic_fields", status, details, hint=hint)
+    except Exception as exc:  # noqa: BLE001
+        add_check(
+            results,
+            "logs:basic_fields",
+            "fail",
+            f"Failed to read {log_path.name}: {exc}",
+            hint="Validate JSON log structure under .agents/logs/",
+        )
+
+
+def summarize(results: List[Dict[str, Any]]) -> Tuple[int, int, int]:
+    ok = sum(1 for r in results if r["status"] == "ok")
+    warn = sum(1 for r in results if r["status"] == "warn")
+    fail = sum(1 for r in results if r["status"] == "fail")
+    return ok, warn, fail
+
+
+def compute_exit_code(ok: int, warn: int, fail: int, profile_missing: bool, strict: bool) -> int:
+    if profile_missing:
+        return 3
+    if fail:
+        return 2
+    if warn:
+        return 1 if strict or warn else 0
+    return 0
+
+
+def perform_fixes(enabled: bool) -> Tuple[bool, List[str]]:
+    if not enabled:
+        return False, []
+    actions: List[str] = []
+    changed = False
+
+    dirs = [
+        LOG_DIR,
+        MEMORY_ROOT,
+        MEMORY_PROFILES,
+        MEMORY_SESSIONS,
+        MEMORY_WORKFLOWS,
+    ]
+    for d in dirs:
+        changed |= safe_make_dir(d, ROOT, actions)
+
+    scripts = [
+        ROOT / "scripts" / "agent",
+        ROOT / "scripts" / "agent-workflow",
+        ROOT / "scripts" / "router",
+        ROOT / "scripts" / "memory",
+        ROOT / "scripts" / "doctor",
+    ]
+    for s in scripts:
+        changed |= safe_chmod_x(s, actions)
+
+    return changed, actions
+
+
+def check_agent_executable(results: List[Dict[str, Any]]) -> None:
+    agent_path = ROOT / "scripts" / "agent"
+    if not agent_path.exists():
+        add_check(
+            results,
+            "agent script exists",
+            "fail",
+            f"Missing: {agent_path}",
+            hint="Restore scripts/agent from repo.",
+        )
+        return
+    if os.access(agent_path, os.X_OK):
+        add_check(results, "agent script executable", "ok", f"Executable: {agent_path}")
+    else:
+        add_check(
+            results,
+            "agent script executable",
+            "warn",
+            f"Not executable: {agent_path}",
+            hint=f"chmod +x {agent_path}",
+        )
+
+
+def check_router(results: List[Dict[str, Any]]) -> None:
+    router_path = ROOT / "scripts" / "router"
+    if not router_path.exists():
+        add_check(
+            results,
+            "router script exists",
+            "fail",
+            f"Missing: {router_path}",
+            hint="Restore scripts/router from repo.",
+        )
+        return
+    if os.access(router_path, os.X_OK):
+        add_check(results, "router script executable", "ok", f"Executable: {router_path}")
+    else:
+        add_check(
+            results,
+            "router script executable",
+            "warn",
+            f"Not executable: {router_path}",
+            hint=f"chmod +x {router_path}",
+        )
+        return
+
+    try:
+        with AGENTS_FILE.open("r", encoding="utf-8") as fh:
+            yaml.safe_load(fh)
+        with WORKFLOWS_FILE.open("r", encoding="utf-8") as fh:
+            yaml.safe_load(fh)
+        add_check(results, "router configs parse", "ok", "agents.yaml and workflows.yaml parsed")
+    except FileNotFoundError as exc:
+        add_check(
+            results,
+            "router configs parse",
+            "fail",
+            f"Missing config: {exc}",
+            hint="Ensure .agents/agents.yaml and .agents/workflows.yaml exist.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        add_check(
+            results,
+            "router configs parse",
+            "fail",
+            f"Parse error: {exc}",
+            hint="Validate YAML syntax for .agents/agents.yaml and .agents/workflows.yaml",
+        )
+
+    try:
+        proc = subprocess.run(
+            [str(router_path), "list"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if proc.returncode == 0:
+            detail = "router list exited 0"
+            if proc.stdout:
+                first_line = proc.stdout.strip().splitlines()[0]
+                if first_line:
+                    detail += f" ({first_line})"
+            add_check(results, "router list", "ok", detail)
+        else:
+            detail = f"router list returned {proc.returncode}"
+            if proc.stderr:
+                detail += f" | stderr: {proc.stderr.strip()[:160]}"
+            add_check(
+                results,
+                "router list",
+                "warn",
+                detail,
+                hint="Run ./scripts/router list manually to inspect errors.",
+            )
+    except Exception as exc:  # noqa: BLE001
+        add_check(
+            results,
+            "router list",
+            "warn",
+            f"router list failed: {exc}",
+            hint="Run ./scripts/router list manually to inspect errors.",
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="AgenticOS doctor (offline)")
+    parser.add_argument("--json", action="store_true", help="Output JSON only")
+    parser.add_argument("--strict", action="store_true", help="Treat warnings as failures (exit 2)")
+    parser.add_argument("--profile", help="Only check a specific profile")
+    parser.add_argument("--fix", action="store_true", help="Best-effort fixes (mkdir/chmod); never runs installs")
+    parser.add_argument(
+        "--rotate-logs",
+        nargs="?",
+        const=30,
+        type=int,
+        metavar="DAYS",
+        help="Archive logs older than N days (default: 30)",
+    )
+    args = parser.parse_args()
+
+    # Handle log rotation (standalone command)
+    if args.rotate_logs is not None:
+        days = args.rotate_logs
+        archived, errors = rotate_logs(days)
+        if args.json:
+            import json as json_mod
+            print(json_mod.dumps({
+                "action": "rotate_logs",
+                "days": days,
+                "archived": archived,
+                "errors": errors,
+                "archive_dir": str(LOG_ARCHIVE_DIR),
+            }, indent=2))
+        else:
+            print(f"Log rotation: archived={archived} errors={errors} (logs older than {days} days)")
+            if archived > 0:
+                print(f"Archive location: {LOG_ARCHIVE_DIR}")
+        return 0 if errors == 0 else 1
+
+    results: List[Dict[str, Any]] = []
+
+    py_meta = {
+        "executable": sys.executable,
+        "version": sys.version.split()[0],
+        "venv": bool(os.environ.get("VIRTUAL_ENV") or Path(sys.executable) == VENV_PY),
+    }
+
+    fixed, fix_actions = perform_fixes(args.fix)
+
+    profile_missing = False
+
+    # Static checks
+    data = check_agents_file(results)
+    workflows_data = check_workflows_file(results)
+    _ = workflows_data  # reserved for future checks
+    profiles = (data.get("profiles") if isinstance(data, dict) else {}) or {}
+    target_profiles = [args.profile] if args.profile else list(profiles.keys())
+
+    if args.profile and args.profile not in profiles:
+        profile_missing = True
+        add_check(
+            results,
+            "profile_exists",
+            "fail",
+            f"Profile '{args.profile}' not found in agents.yaml",
+            hint="Update --profile name or add it to .agents/agents.yaml",
+        )
+    else:
+        for name in target_profiles:
+            cfg = profiles.get(name, {}) if isinstance(profiles, dict) else {}
+            check_profile(results, name, cfg)
+
+    # Writable checks
+    check_writable(results, LOG_DIR, "logs")
+    check_writable(results, MEMORY_ROOT, "memory")
+    check_writable(results, MEMORY_PROFILES, "memory/profiles")
+    check_writable(results, MEMORY_SESSIONS, "memory/sessions")
+    check_workflow_memory_dir(results)
+    check_summary_file(results)
+    check_agent_executable(results)
+    check_router(results)
+    check_log_schema(results)
+    check_workflow_delta_logging(results)
+    check_router_auto_rules(results)
+
+    ok, warn, fail = summarize(results)
+    exit_code = compute_exit_code(ok, warn, fail, profile_missing, args.strict)
+
+    output = {
+        "root": str(ROOT),
+        "profile_filter": args.profile or "all",
+        "python": py_meta,
+        "summary": {"ok": ok, "warn": warn, "fail": fail, "exit_code": exit_code},
+        "checks": results,
+        "fixed": fixed,
+        "fix_actions": fix_actions,
+    }
+
+    if args.json:
+        print(json.dumps(output, indent=2))
+        return exit_code
+
+    # Human-readable output
+    print(f"Python: {py_meta['executable']} (venv={py_meta['venv']}, version={py_meta['version']})")
+    for r in results:
+        status = r["status"].upper()
+        hint = r.get("hint") or ""
+        hint_str = f" | hint: {hint}" if hint else ""
+        print(f"[{status}] {r['name']}: {r['details']}{hint_str}")
+    print(f"\nSummary: ok={ok} warn={warn} fail={fail} exit={exit_code}{' (strict)' if args.strict else ''}")
+    if args.fix:
+        if fix_actions:
+            print("\nFix actions:")
+            for act in fix_actions:
+                print(f"- {act}")
+        print(
+            "\nVerification commands:\n"
+            "  ./scripts/doctor\n"
+            "  ./scripts/doctor --json | python3 -m json.tool | head -n 40\n"
+            "  ./scripts/doctor --strict; echo \"exit=$?\"\n"
+            "  AGENT_TIMEOUT=2 ./scripts/agent dev --no-memory; echo \"exit=$?\"\n"
+        )
+    return exit_code
+
+
+if __name__ == "__main__":
+    try:
+        import shutil  # type: ignore  # Local import to keep top small
+    except Exception:  # noqa: BLE001
+        sys.stderr.write("shutil is required (stdlib).\n")
+        sys.exit(2)
+    sys.exit(main())

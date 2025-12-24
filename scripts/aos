@@ -1,0 +1,948 @@
+#!/usr/bin/env python3
+"""AgenticOS unified CLI - shortcut commands for the AgenticOS system.
+
+Usage:
+    aos                     # List profiles & workflows (default)
+    aos doctor [--fix]      # Health check
+    aos list [--json]       # List profiles & workflows
+    aos <profile> "prompt"  # Run a profile directly
+    aos wf <name> "prompt"  # Execute a workflow
+    aos continue            # Continue last session
+    aos logs [--tail]       # View logs
+    aos memory [profile]    # View memory
+    aos init                # Initialize .agents/ in current dir
+    aos help                # Show help
+    aos version             # Show version
+"""
+
+import os
+import sys
+from pathlib import Path
+
+# Find AgenticOS root (where this script lives)
+ROOT = Path(__file__).resolve().parent.parent
+VENV_PY = ROOT / ".venv" / "bin" / "python"
+
+# Auto-switch into the AgenticOS venv if it exists and we're not already in it
+if not os.environ.get("VIRTUAL_ENV") and VENV_PY.exists() and Path(sys.executable) != VENV_PY:
+    os.execv(str(VENV_PY), [str(VENV_PY)] + sys.argv)
+
+import json
+import subprocess
+from typing import List, Optional
+
+# Version
+VERSION = "1.0.0"
+
+SCRIPTS = ROOT / "scripts"
+AGENTS_DIR = ROOT / ".agents"
+
+# User config directory for global settings
+USER_CONFIG_DIR = Path.home() / ".agenticos"
+PROJECTS_FILE = USER_CONFIG_DIR / "projects.yaml"
+
+# Reserved commands (cannot be profile names for direct invocation)
+RESERVED_COMMANDS = {
+    "doctor", "list", "run", "wf", "workflow",
+    "logs", "memory", "init", "help", "version",
+    "continue", "status", "projects", "auto",
+}
+
+
+def load_yaml_safe(path: Path) -> dict:
+    """Load YAML file safely."""
+    try:
+        import yaml
+    except ImportError:
+        sys.stderr.write("PyYAML required. Run ./install.sh\n")
+        sys.exit(1)
+
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def save_yaml(path: Path, data: dict) -> None:
+    """Save YAML file."""
+    try:
+        import yaml
+    except ImportError:
+        sys.stderr.write("PyYAML required. Run ./install.sh\n")
+        sys.exit(1)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False)
+
+
+def load_projects() -> dict:
+    """Load registered projects from ~/.agenticos/projects.yaml."""
+    return load_yaml_safe(PROJECTS_FILE).get("projects", {})
+
+
+def save_projects(projects: dict) -> None:
+    """Save projects to ~/.agenticos/projects.yaml."""
+    save_yaml(PROJECTS_FILE, {"projects": projects})
+
+
+def get_project_path(name_or_alias: str) -> Optional[Path]:
+    """Get project path by name or alias."""
+    projects = load_projects()
+    if name_or_alias in projects:
+        return Path(projects[name_or_alias]["path"])
+    # Check aliases
+    for pname, pdata in projects.items():
+        if name_or_alias in pdata.get("aliases", []):
+            return Path(pdata["path"])
+    return None
+
+
+def get_profiles_and_aliases() -> tuple:
+    """Get list of valid profiles and their aliases."""
+    agents_file = AGENTS_DIR / "agents.yaml"
+    agents = load_yaml_safe(agents_file)
+
+    profiles = set(agents.get("profiles", {}).keys())
+
+    # Build alias -> profile mapping
+    aliases = {}
+    global_aliases = agents.get("aliases", {})
+    for alias, target in global_aliases.items():
+        if target in profiles:
+            aliases[alias] = target
+
+    # Per-profile aliases
+    for name, cfg in agents.get("profiles", {}).items():
+        if isinstance(cfg, dict):
+            for alias in cfg.get("aliases", []):
+                aliases[alias] = name
+
+    return profiles, aliases
+
+
+def resolve_profile(name: str) -> Optional[str]:
+    """Resolve a profile name or alias to actual profile name."""
+    profiles, aliases = get_profiles_and_aliases()
+
+    if name in profiles:
+        return name
+    if name in aliases:
+        return aliases[name]
+    return None
+
+
+def run_script(
+    script: str,
+    args: List[str],
+    env: Optional[dict] = None,
+    stdin_text: Optional[str] = None,
+) -> int:
+    """Run a script from the scripts directory."""
+    script_path = SCRIPTS / script
+    if not script_path.exists():
+        sys.stderr.write(f"Script not found: {script_path}\n")
+        return 1
+
+    cmd = [str(script_path)] + args
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+
+    try:
+        if stdin_text:
+            result = subprocess.run(
+                cmd,
+                env=run_env,
+                input=stdin_text,
+                text=True,
+            )
+        else:
+            result = subprocess.run(cmd, env=run_env)
+        return result.returncode
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_doctor(args: List[str]) -> int:
+    """Run health check."""
+    return run_script("doctor", args)
+
+
+def cmd_list(args: List[str]) -> int:
+    """List profiles and workflows."""
+    return run_script("router", ["list"] + args)
+
+
+def cmd_run(profile: str, args: List[str], verbose: bool = False) -> int:
+    """Run a profile with given arguments."""
+    # Check if profile exists
+    resolved = resolve_profile(profile)
+    if not resolved:
+        sys.stderr.write(f"Unknown profile or alias: '{profile}'\n")
+        sys.stderr.write("Run 'aos list' to see available profiles.\n")
+        return 1
+
+    # Separate prompt from options
+    # If first arg doesn't start with '-', treat it as a prompt
+    prompt_text = None
+    options = []
+
+    for i, arg in enumerate(args):
+        if arg.startswith("-"):
+            # Rest are options
+            options = args[i:]
+            break
+        elif prompt_text is None:
+            # First non-option is the prompt
+            prompt_text = arg
+        else:
+            # Additional words become part of prompt
+            prompt_text += " " + arg
+
+    # Check for verbose flag in options
+    if "-v" in options or "--verbose" in options:
+        verbose = True
+        options = [o for o in options if o not in ("-v", "--verbose")]
+
+    # Quick profile gets clean output by default (unless verbose)
+    if resolved == "quick" and not verbose:
+        # Add clean output flags if not already specified
+        has_print = any(o.startswith("--print") for o in options)
+        has_quiet = "--quiet" in options or "-q" in options
+        has_memory = "--no-memory" in options
+
+        if not has_print:
+            options = ["--print", "clean"] + options
+        if not has_quiet:
+            options = ["--quiet"] + options
+        if not has_memory:
+            options = ["--no-memory"] + options
+
+    # Build router command
+    router_args = ["run", resolved]
+    if options:
+        router_args.append("--")
+        router_args.extend(options)
+
+    return run_script("router", router_args, stdin_text=prompt_text)
+
+
+def cmd_workflow(args: List[str]) -> int:
+    """Execute a workflow."""
+    if not args:
+        sys.stderr.write("Usage: aos wf <workflow-name> [prompt...]\n")
+        return 1
+
+    workflow_name = args[0]
+    rest = args[1:] if len(args) > 1 else []
+
+    # Separate prompt from options
+    prompt_text = None
+    options = []
+
+    for i, arg in enumerate(rest):
+        if arg.startswith("-"):
+            options = rest[i:]
+            break
+        elif prompt_text is None:
+            prompt_text = arg
+        else:
+            prompt_text += " " + arg
+
+    router_args = ["run", f"workflow:{workflow_name}", "--execute"]
+    if options:
+        router_args.append("--")
+        router_args.extend(options)
+
+    return run_script("router", router_args, stdin_text=prompt_text)
+
+
+def cmd_continue(args: List[str]) -> int:
+    """Continue the last session."""
+    # Find the last profile used from logs
+    logs_dir = AGENTS_DIR / "logs"
+    if not logs_dir.exists():
+        sys.stderr.write("No logs found. Nothing to continue.\n")
+        return 1
+
+    # Find most recent non-router log
+    log_files = sorted(logs_dir.glob("*.json"), key=lambda p: p.name, reverse=True)
+    last_profile = None
+
+    for log_file in log_files:
+        if log_file.name.startswith("router-") or "-workflow-" in log_file.name:
+            continue
+        try:
+            with log_file.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            last_profile = data.get("profile")
+            if last_profile:
+                break
+        except Exception:
+            continue
+
+    if not last_profile:
+        sys.stderr.write("Could not determine last profile. Specify one: aos <profile> --continue\n")
+        return 1
+
+    print(f"Continuing last session with profile: {last_profile}")
+
+    router_args = ["run", last_profile, "--", "--continue", "last"]
+    router_args.extend(args)
+
+    return run_script("router", router_args)
+
+
+def cmd_logs(args: List[str]) -> int:
+    """View or manage logs."""
+    logs_dir = AGENTS_DIR / "logs"
+
+    if "--tail" in args or "-t" in args:
+        # Show content of latest agent log (skip router/workflow logs)
+        if not logs_dir.exists():
+            sys.stderr.write("No logs found.\n")
+            return 1
+
+        log_files = sorted(logs_dir.glob("*.json"), key=lambda p: p.name, reverse=True)
+        if not log_files:
+            sys.stderr.write("No log files found.\n")
+            return 1
+
+        # Find the most recent agent log (not router or workflow)
+        latest = None
+        for lf in log_files:
+            if not lf.name.startswith("router-") and "-workflow-" not in lf.name:
+                latest = lf
+                break
+
+        if not latest:
+            sys.stderr.write("No agent logs found.\n")
+            return 1
+
+        print(f"=== {latest.name} ===")
+        try:
+            with latest.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Show key fields
+            print(f"Profile: {data.get('profile', 'unknown')}")
+            print(f"Provider: {data.get('provider', 'unknown')}")
+            print(f"Exit: {data.get('exit_code', 'unknown')}")
+            print(f"Time: {data.get('timestamp_start', 'unknown')}")
+            if data.get("stdout_norm"):
+                print("\n--- Output ---")
+                print(data["stdout_norm"][:2000])
+        except Exception as e:
+            sys.stderr.write(f"Error reading log: {e}\n")
+            return 1
+        return 0
+
+    elif "--rotate" in args or "-r" in args:
+        # Rotate logs
+        rotate_args = ["--rotate-logs"]
+        # Check for days argument
+        for i, arg in enumerate(args):
+            if arg in ("--rotate", "-r") and i + 1 < len(args):
+                try:
+                    days = int(args[i + 1])
+                    rotate_args = [f"--rotate-logs", str(days)]
+                except ValueError:
+                    pass
+        return run_script("doctor", rotate_args)
+
+    elif "--json" in args:
+        # List logs as JSON
+        if not logs_dir.exists():
+            print("[]")
+            return 0
+        log_files = sorted(logs_dir.glob("*.json"), key=lambda p: p.name, reverse=True)[:20]
+        logs = []
+        for lf in log_files:
+            try:
+                with lf.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                logs.append({
+                    "file": lf.name,
+                    "profile": data.get("profile"),
+                    "exit_code": data.get("exit_code"),
+                    "timestamp": data.get("timestamp_start"),
+                })
+            except Exception:
+                pass
+        print(json.dumps(logs, indent=2))
+        return 0
+
+    else:
+        # List recent logs
+        if not logs_dir.exists():
+            print("No logs directory found.")
+            return 0
+
+        log_files = sorted(logs_dir.glob("*.json"), key=lambda p: p.name, reverse=True)[:10]
+        if not log_files:
+            print("No logs found.")
+            return 0
+
+        print("Recent logs:")
+        for lf in log_files:
+            try:
+                with lf.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                profile = data.get("profile", "?")
+                exit_code = data.get("exit_code", "?")
+                print(f"  {lf.name}  [{profile}] exit={exit_code}")
+            except Exception:
+                print(f"  {lf.name}  (error reading)")
+        return 0
+
+
+def cmd_memory(args: List[str]) -> int:
+    """View memory for a profile."""
+    memory_dir = AGENTS_DIR / "memory" / "profiles"
+
+    if not args:
+        # Show summary
+        summary_file = AGENTS_DIR / "memory" / "summary.md"
+        if summary_file.exists():
+            print(summary_file.read_text(encoding="utf-8"))
+        else:
+            print("No memory summary found.")
+            if memory_dir.exists():
+                print("\nAvailable profile memories:")
+                for mf in memory_dir.glob("*.md"):
+                    print(f"  - {mf.stem}")
+        return 0
+
+    profile = args[0]
+
+    if profile == "--clear":
+        if len(args) < 2:
+            sys.stderr.write("Usage: aos memory --clear <profile>\n")
+            return 1
+        profile = args[1]
+        mem_file = memory_dir / f"{profile}.md"
+        if mem_file.exists():
+            mem_file.unlink()
+            print(f"Cleared memory for profile: {profile}")
+        else:
+            print(f"No memory file found for: {profile}")
+        return 0
+
+    # Show specific profile memory
+    resolved = resolve_profile(profile)
+    if resolved:
+        profile = resolved
+
+    mem_file = memory_dir / f"{profile}.md"
+    if mem_file.exists():
+        print(f"=== Memory: {profile} ===")
+        print(mem_file.read_text(encoding="utf-8"))
+    else:
+        print(f"No memory found for profile: {profile}")
+    return 0
+
+
+def cmd_init(args: List[str]) -> int:
+    """Initialize .agents/ in current directory."""
+    target = Path.cwd()
+    if args:
+        target = Path(args[0]).resolve()
+
+    agents_dir = target / ".agents"
+
+    if agents_dir.exists():
+        print(f".agents/ already exists in {target}")
+        return 0
+
+    # Create directory structure
+    dirs = [
+        agents_dir,
+        agents_dir / "prompts",
+        agents_dir / "memory" / "profiles",
+        agents_dir / "memory" / "sessions",
+        agents_dir / "memory" / "workflows",
+        agents_dir / "logs",
+    ]
+
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+        print(f"Created: {d.relative_to(target)}")
+
+    # Create minimal agents.yaml
+    agents_yaml = agents_dir / "agents.yaml"
+    agents_yaml.write_text("""\
+default_profile: dev
+
+profiles:
+  dev:
+    description: "Development assistant"
+    provider: codex
+    prompt: ".agents/prompts/dev.md"
+    command: 'codex exec --skip-git-repo-check -'
+    memory_file: ".agents/memory/profiles/dev.md"
+
+  quick:
+    description: "Quick questions via Gemini"
+    provider: gemini
+    prompt: ".agents/prompts/quick.md"
+    command: 'gemini -o text -'
+    memory_file: ".agents/memory/profiles/quick.md"
+
+aliases:
+  d: dev
+  q: quick
+""", encoding="utf-8")
+    print(f"Created: .agents/agents.yaml")
+
+    # Create minimal prompts
+    dev_prompt = agents_dir / "prompts" / "dev.md"
+    dev_prompt.write_text("""\
+You are a development assistant for this project.
+
+Review the project context provided and help with coding tasks.
+Be concise and focus on actionable solutions.
+""", encoding="utf-8")
+    print(f"Created: .agents/prompts/dev.md")
+
+    quick_prompt = agents_dir / "prompts" / "quick.md"
+    quick_prompt.write_text("""\
+You are a quick assistant for brainstorming and drafting.
+
+Guidelines:
+- Be concise (3-5 sentences when possible)
+- Use bullet points for lists
+- Focus on actionable answers
+""", encoding="utf-8")
+    print(f"Created: .agents/prompts/quick.md")
+
+    # Create workflows.yaml
+    workflows_yaml = agents_dir / "workflows.yaml"
+    workflows_yaml.write_text("""\
+workflows: {}
+""", encoding="utf-8")
+    print(f"Created: .agents/workflows.yaml")
+
+    print(f"\nInitialized AgenticOS in: {target}")
+    print("Run 'aos doctor' to verify setup.")
+    return 0
+
+
+def cmd_projects(args: List[str]) -> int:
+    """Manage registered projects."""
+    # Check for verbose flag
+    verbose = "-v" in args or "--verbose" in args
+    args = [a for a in args if a not in ("-v", "--verbose")]
+
+    if not args or args[0] in ("list", "ls"):
+        # List projects
+        projects = load_projects()
+        if not projects:
+            print("No projects registered.")
+            print("\nRegister a project:")
+            print("  aos projects add /path/to/project --name myproject")
+            print("  aos projects add .  # Add current directory")
+            return 0
+
+        if verbose:
+            # Verbose output with paths and status
+            print("Registered projects:\n")
+            for name, data in sorted(projects.items()):
+                path = data.get("path", "")
+                aliases = data.get("aliases", [])
+                exists = Path(path).exists() and (Path(path) / ".agents").exists()
+                status = "ok" if exists else "missing"
+                alias_str = f" (aliases: {', '.join(aliases)})" if aliases else ""
+                print(f"  {name}{alias_str}")
+                print(f"    Path: {path}")
+                print(f"    Status: {status}")
+                print()
+        else:
+            # Simple clean list
+            for name in sorted(projects.keys()):
+                print(name)
+        return 0
+
+    subcmd = args[0]
+
+    if subcmd == "add":
+        # Add a project
+        path = Path.cwd() if len(args) < 2 else Path(args[1]).resolve()
+
+        # Parse --name option
+        name = None
+        for i, arg in enumerate(args):
+            if arg in ("--name", "-n") and i + 1 < len(args):
+                name = args[i + 1]
+                break
+
+        # Parse --alias option
+        aliases = []
+        for i, arg in enumerate(args):
+            if arg in ("--alias", "-a") and i + 1 < len(args):
+                aliases.append(args[i + 1])
+
+        if not path.exists():
+            sys.stderr.write(f"Path does not exist: {path}\n")
+            return 1
+
+        agents_dir = path / ".agents"
+        if not agents_dir.exists():
+            sys.stderr.write(f"No .agents/ directory found in: {path}\n")
+            sys.stderr.write("Run 'aos init' first to initialize the project.\n")
+            return 1
+
+        # Generate name from directory if not provided
+        if not name:
+            name = path.name.lower().replace(" ", "-").replace("_", "-")
+            # Clean up common patterns
+            for suffix in ["-agents", ".agents", "-project"]:
+                if name.endswith(suffix):
+                    name = name[:-len(suffix)]
+
+        projects = load_projects()
+
+        # Check if name exists
+        if name in projects:
+            existing_path = projects[name].get("path", "")
+            if existing_path == str(path):
+                print(f"Project '{name}' already registered at {path}")
+                return 0
+            sys.stderr.write(f"Project name '{name}' already exists for: {existing_path}\n")
+            sys.stderr.write(f"Use --name to specify a different name.\n")
+            return 1
+
+        projects[name] = {
+            "path": str(path),
+            "aliases": aliases,
+        }
+        save_projects(projects)
+        print(f"Added project: {name}")
+        print(f"  Path: {path}")
+        if aliases:
+            print(f"  Aliases: {', '.join(aliases)}")
+        print(f"\nUse with: aos -p {name} <profile> 'prompt'")
+        return 0
+
+    elif subcmd in ("remove", "rm", "delete"):
+        if len(args) < 2:
+            sys.stderr.write("Usage: aos projects remove <name>\n")
+            return 1
+
+        name = args[1]
+        projects = load_projects()
+
+        if name not in projects:
+            sys.stderr.write(f"Project not found: {name}\n")
+            return 1
+
+        del projects[name]
+        save_projects(projects)
+        print(f"Removed project: {name}")
+        return 0
+
+    elif subcmd == "scan":
+        # Scan for projects with .agents/ directories
+        scan_path = Path.home() if len(args) < 2 else Path(args[1]).resolve()
+        max_depth = 4
+
+        print(f"Scanning for AgenticOS projects in: {scan_path}")
+        print(f"Max depth: {max_depth}")
+        print()
+
+        found = []
+
+        def scan_dir(path: Path, depth: int = 0):
+            if depth > max_depth:
+                return
+            try:
+                agents_dir = path / ".agents"
+                if agents_dir.exists() and (agents_dir / "agents.yaml").exists():
+                    found.append(path)
+                    return  # Don't scan inside projects
+
+                for item in path.iterdir():
+                    if item.is_dir() and not item.name.startswith("."):
+                        scan_dir(item, depth + 1)
+            except PermissionError:
+                pass
+
+        scan_dir(scan_path)
+
+        if not found:
+            print("No AgenticOS projects found.")
+            return 0
+
+        print(f"Found {len(found)} project(s):\n")
+        projects = load_projects()
+        registered_paths = {p.get("path") for p in projects.values()}
+
+        for proj_path in found:
+            status = "registered" if str(proj_path) in registered_paths else "not registered"
+            print(f"  {proj_path}")
+            print(f"    Status: {status}")
+
+        print("\nTo register a project:")
+        print("  aos projects add /path/to/project --name myname")
+        return 0
+
+    elif subcmd == "alias":
+        # Add alias to existing project
+        if len(args) < 3:
+            sys.stderr.write("Usage: aos projects alias <project> <alias>\n")
+            return 1
+
+        project_name = args[1]
+        new_alias = args[2]
+        projects = load_projects()
+
+        if project_name not in projects:
+            sys.stderr.write(f"Project not found: {project_name}\n")
+            return 1
+
+        aliases = projects[project_name].get("aliases", [])
+        if new_alias not in aliases:
+            aliases.append(new_alias)
+            projects[project_name]["aliases"] = aliases
+            save_projects(projects)
+            print(f"Added alias '{new_alias}' to project '{project_name}'")
+        else:
+            print(f"Alias '{new_alias}' already exists for project '{project_name}'")
+        return 0
+
+    else:
+        sys.stderr.write(f"Unknown projects subcommand: {subcmd}\n")
+        sys.stderr.write("Available: list, add, remove, scan, alias\n")
+        return 1
+
+
+def cmd_auto(args: List[str]) -> int:
+    """Auto-route a prompt to the best profile/workflow.
+
+    Uses keyword matching by default, or AI classification with --smart.
+    Supports both formats:
+        aos auto "prompt" -- --full-auto
+        aos auto -- --full-auto "prompt"
+    """
+    # Separate auto flags, prompt, and passthrough args
+    auto_flags = []
+    prompt_parts = []
+    passthrough_flags = []
+
+    # Check for -- separator
+    if "--" in args:
+        sep_idx = args.index("--")
+        before_sep = args[:sep_idx]
+        after_sep = args[sep_idx + 1:]  # Skip the -- itself
+    else:
+        before_sep = args
+        after_sep = []
+
+    # Parse args before --
+    i = 0
+    while i < len(before_sep):
+        arg = before_sep[i]
+        if arg in ("--smart", "-s"):
+            auto_flags.append("--smart")
+        elif arg in ("--explain", "-e"):
+            auto_flags.append("--explain")
+        elif arg in ("--dry-run", "-n"):
+            auto_flags.append("--dry-run")
+        elif arg == "--timeout" and i + 1 < len(before_sep):
+            auto_flags.extend(["--timeout", before_sep[i + 1]])
+            i += 1
+        elif arg.startswith("--timeout="):
+            auto_flags.append(arg)
+        else:
+            prompt_parts.append(arg)
+        i += 1
+
+    # Parse args after -- (flags go to passthrough, non-flags are prompt)
+    for arg in after_sep:
+        if arg.startswith("-"):
+            passthrough_flags.append(arg)
+        else:
+            prompt_parts.append(arg)
+
+    if not prompt_parts:
+        print("Usage: aos auto \"your prompt\"")
+        print("       aos auto --smart \"your prompt\"  # Use AI to pick best profile")
+        print("       aos auto -- --full-auto \"prompt\"  # With write access")
+        print()
+        print("Options:")
+        print("  --smart, -s    Use AI (Gemini) to classify and route")
+        print("  --explain, -e  Show routing decision details")
+        print("  --dry-run, -n  Show what would run without executing")
+        print("  -- <args>      Pass remaining args to the target profile")
+        return 1
+
+    prompt = " ".join(prompt_parts)
+
+    # Build router auto command: flags + prompt + passthrough
+    # Format: router auto [flags] "prompt" -- passthrough_flags
+    router_args = ["auto"] + auto_flags + [prompt]
+    if passthrough_flags:
+        router_args.extend(["--"] + passthrough_flags)
+
+    return run_script("router", router_args)
+
+
+def cmd_help(args: List[str]) -> int:
+    """Show help."""
+    help_text = """\
+AgenticOS CLI (aos) - Unified command interface
+
+USAGE:
+    aos                          List profiles & workflows (default)
+    aos <profile> [prompt...]    Run a profile directly
+    aos <alias> [prompt...]      Run using profile alias
+
+COMMANDS:
+    doctor [--fix]               Health check (--fix to auto-repair)
+    list [--json]                List profiles & workflows
+    run <profile> [args...]      Explicit profile run
+    auto "prompt"                Auto-pick best profile for prompt
+    wf <name> [prompt...]        Execute a workflow
+    continue [args...]           Continue last session
+    logs [--tail|--rotate N]     View or manage logs
+    memory [profile|--clear p]   View or clear memory
+    init [path]                  Initialize .agents/ in directory
+    projects [subcmd]            Manage registered projects
+    help                         Show this help
+    version                      Show version
+
+PROJECTS:
+    aos projects                 List registered projects
+    aos projects add [path]      Register a project (default: current dir)
+    aos projects add . -n name   Register with custom name
+    aos projects remove <name>   Unregister a project
+    aos projects scan [path]     Scan for AgenticOS projects
+    aos projects alias <p> <a>   Add alias to project
+
+AUTO-ROUTING:
+    aos auto "prompt"            Auto-pick profile using keywords
+    aos auto --smart "prompt"    Auto-pick using AI (smarter, slower)
+    aos auto --explain "prompt"  Show why a profile was chosen
+    aos auto --dry-run "prompt"  Show choice without running
+    aos auto "prompt" -- --full-auto   Pass options to target profile
+
+PROFILE SHORTCUTS:
+    aos d "prompt"               Same as: aos dev "prompt"
+    aos q "prompt"               Quick question (clean output, no memory)
+    aos q "prompt" -v            Quick with verbose output
+    aos g "prompt"               Same as: aos grc "prompt"
+
+OPTIONS:
+    -v, --verbose                Full verbose output (for q profile)
+    --no-memory                  Don't use memory
+    --quiet                      Suppress banners
+    --print clean                Just the answer, no headers
+    --print summary              Show only summary
+    --continue [ref]             Continue from session
+
+EXAMPLES:
+    aos                          # List what's available
+    aos doctor --fix             # Fix common issues
+    aos d "fix the login bug"    # Run dev profile
+    aos q "What is 2+2?"         # Quick answer: just "4"
+    aos q "Explain recursion" -v # Verbose quick output
+    aos continue                 # Resume last session
+    aos logs --tail              # See last output
+    aos wf auto_fix_bug "bug"    # Run workflow
+    aos projects add . -n myproj # Register current project
+    aos -p myproj d "prompt"     # Run in registered project
+
+PROJECT MODE:
+    aos -p /path/to/project d "prompt"
+
+    Runs against a different project's .agents/ config.
+"""
+    print(help_text)
+    return 0
+
+
+def cmd_version(args: List[str]) -> int:
+    """Show version."""
+    print(f"aos (AgenticOS CLI) v{VERSION}")
+    print(f"Root: {ROOT}")
+    return 0
+
+
+def main() -> int:
+    args = sys.argv[1:]
+
+    # Handle project mode flag
+    project_path = None
+    if args and args[0] in ("-p", "--project"):
+        if len(args) < 2:
+            sys.stderr.write("Missing project path/name after -p/--project\n")
+            return 1
+        project_ref = args[1]
+        args = args[2:]
+
+        # Check if it's a registered project name/alias first
+        registered_path = get_project_path(project_ref)
+        if registered_path:
+            project_path = str(registered_path)
+        elif Path(project_ref).exists():
+            project_path = str(Path(project_ref).resolve())
+        else:
+            sys.stderr.write(f"Project not found: '{project_ref}'\n")
+            sys.stderr.write("Use a registered project name or valid path.\n")
+            sys.stderr.write("Run 'aos projects' to see registered projects.\n")
+            return 1
+
+        os.environ["AGENTICOS_PROJECT_ROOT"] = project_path
+        os.environ["AGENTICOS_PROJECT_AGENTS"] = str(Path(project_path) / ".agents")
+
+    # Default action: list
+    if not args:
+        return cmd_list([])
+
+    cmd = args[0]
+    rest = args[1:]
+
+    # Built-in commands
+    if cmd == "doctor":
+        return cmd_doctor(rest)
+    elif cmd == "list":
+        return cmd_list(rest)
+    elif cmd == "run":
+        if not rest:
+            sys.stderr.write("Usage: aos run <profile> [args...]\n")
+            return 1
+        return cmd_run(rest[0], rest[1:])
+    elif cmd in ("wf", "workflow"):
+        return cmd_workflow(rest)
+    elif cmd == "continue":
+        return cmd_continue(rest)
+    elif cmd == "logs":
+        return cmd_logs(rest)
+    elif cmd == "memory":
+        return cmd_memory(rest)
+    elif cmd == "init":
+        return cmd_init(rest)
+    elif cmd in ("projects", "project", "proj"):
+        return cmd_projects(rest)
+    elif cmd == "auto":
+        return cmd_auto(rest)
+    elif cmd in ("help", "--help", "-h"):
+        return cmd_help(rest)
+    elif cmd in ("version", "--version", "-v"):
+        return cmd_version(rest)
+    elif cmd == "status":
+        # Alias for doctor
+        return cmd_doctor(rest)
+
+    # Not a built-in command - try as profile name/alias
+    resolved = resolve_profile(cmd)
+    if resolved:
+        return cmd_run(cmd, rest)
+
+    # Unknown command
+    sys.stderr.write(f"Unknown command or profile: '{cmd}'\n")
+    sys.stderr.write("Run 'aos help' for usage.\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

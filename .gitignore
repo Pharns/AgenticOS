@@ -1,0 +1,50 @@
+# Environment and secrets
+.env
+.env.local
+*.key
+*.pem
+
+# Codex credentials and sessions (sensitive)
+.agents/codex/
+
+# Backup files
+*.bak
+*.bak.*
+
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+._*
+
+# Logs (keep structure, ignore contents)
+.agents/logs/*
+!.agents/logs/.gitkeep
+
+# Memory files (user-specific)
+.agents/memory/sessions/*
+.agents/memory/last-session.md
+.agents/memory/summary.md
+!.agents/memory/.gitkeep
+!.agents/memory/sessions/.gitkeep
+
+# Claude plans (user-specific)
+.claude/
+
+# Project-specific notes
+notes/
+
+# Temp files
+*.tmp
+*.bak

@@ -1,0 +1,19 @@
+workflows:
+  auto_fix_bug:
+    description: "Plan, implement, and review a small bug fix."
+    keywords: ["bug", "fix", "broken", "error", "issue"]
+    steps:
+      - name: plan
+        profile: research
+      - name: implement
+        profile: dev
+      - name: review
+        profile: grc
+  ops_check:
+    description: "Run diagnostics and produce a risk/ops summary."
+    keywords: ["ops", "diagnostic", "health", "check", "status"]
+    steps:
+      - name: diagnostics
+        profile: ops
+      - name: review
+        profile: grc

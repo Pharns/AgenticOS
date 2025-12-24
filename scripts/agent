@@ -1,0 +1,2721 @@
+#!/usr/bin/env python3
+"""Unified AgenticOS runner with logging.
+
+- Loads profiles from .agents/agents.yaml
+- Validates prompts/CLIs before execution
+- Normalizes provider output with structured sections
+- Writes JSON logs and memory summaries
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import shlex
+import subprocess
+import sys
+import signal
+import textwrap
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import shutil
+
+ROOT = Path(__file__).resolve().parent.parent
+VENV_PY = ROOT / ".venv" / "bin" / "python"
+TIMEOUT_DEFAULT = 120.0  # seconds
+
+# =============================================================================
+# Phase 2: Project-Aware Path Resolution
+# =============================================================================
+# When AGENTICOS_PROJECT_ROOT and AGENTICOS_PROJECT_AGENTS are set (by router),
+# use project-specific paths instead of default AgenticOS paths.
+
+def get_project_context() -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Read project context from environment variables set by router.
+
+    Returns:
+        Tuple of (project_root, agents_dir) or (None, None) if not in project mode
+    """
+    project_root_str = os.environ.get("AGENTICOS_PROJECT_ROOT")
+    agents_dir_str = os.environ.get("AGENTICOS_PROJECT_AGENTS")
+
+    if project_root_str and agents_dir_str:
+        project_root = Path(project_root_str)
+        agents_dir = Path(agents_dir_str)
+        if project_root.exists() and agents_dir.exists():
+            return project_root, agents_dir
+
+    return None, None
+
+
+# Detect project context at module load
+PROJECT_ROOT, PROJECT_AGENTS_DIR = get_project_context()
+
+# Determine effective paths based on project context
+if PROJECT_AGENTS_DIR is not None:
+    # Project mode: use project-specific paths
+    EFFECTIVE_ROOT = PROJECT_ROOT
+    EFFECTIVE_AGENTS_DIR = PROJECT_AGENTS_DIR
+else:
+    # Default mode: use AgenticOS paths
+    EFFECTIVE_ROOT = ROOT
+    EFFECTIVE_AGENTS_DIR = ROOT / ".agents"
+
+
+# =============================================================================
+# Phase 3: Context Ingestion
+# =============================================================================
+# Auto-inject project context files (README.md, CLAUDE.md, etc.) into prompts
+
+DEFAULT_CONTEXT_FILES = [
+    "README.md",
+    "_README.md",
+    "CLAUDE.md",
+    "AGENTS.md",
+]
+
+DEFAULT_CONTEXT_MAX_CHARS = 16000  # ~4K tokens
+
+
+def load_project_context(
+    agents_cfg: Dict[str, Any],
+    profile_cfg: Dict[str, Any],
+    effective_root: Path,
+    max_chars: int = DEFAULT_CONTEXT_MAX_CHARS,
+) -> List[str]:
+    """
+    Load project context files for injection into prompts.
+
+    Args:
+        agents_cfg: Global agents.yaml configuration
+        profile_cfg: Profile-specific configuration
+        effective_root: Project root path
+        max_chars: Maximum total characters to include
+
+    Returns:
+        List of context lines to prepend to stdin, empty if disabled
+    """
+    # Check if context is enabled (global level)
+    global_context = agents_cfg.get("context", {})
+    if not global_context.get("enabled", True):  # Enabled by default
+        return []
+
+    # Check if context is enabled (profile level override)
+    profile_context = profile_cfg.get("context", {})
+    if not profile_context.get("enabled", True):  # Enabled by default
+        return []
+
+    # Get list of context files
+    context_files = global_context.get("files", DEFAULT_CONTEXT_FILES)
+
+    # Add profile-specific extra files
+    extra_files = profile_context.get("extra_files", [])
+    if extra_files:
+        context_files = list(context_files) + list(extra_files)
+
+    # Load context files
+    context_blocks: List[str] = []
+    total_chars = 0
+
+    for filename in context_files:
+        if total_chars >= max_chars:
+            break
+
+        file_path = effective_root / filename
+        if not file_path.exists() or not file_path.is_file():
+            continue
+
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="replace").strip()
+            if not content:
+                continue
+
+            # Check if adding this file would exceed limit
+            remaining = max_chars - total_chars
+            if len(content) > remaining:
+                # Truncate content to fit
+                content = content[:remaining] + "\n... (truncated)"
+
+            context_blocks.append(f"## {filename}\n{content}")
+            total_chars += len(content)
+        except Exception:  # noqa: BLE001
+            # Silently skip files that can't be read
+            continue
+
+    if not context_blocks:
+        return []
+
+    # Format as context block
+    header = "# Project Context"
+    separator = "---"
+    return [header, ""] + context_blocks + ["", separator]
+
+
+# =============================================================================
+# Phase 9: Session Continuity
+# =============================================================================
+# Allow agents to continue from previous sessions, maintaining context across
+# invocations for multi-turn workflows.
+
+SESSION_CONTEXT_MAX_CHARS = 8000  # ~2K tokens for previous session context
+
+
+def find_previous_session(
+    profile: str,
+    session_ref: Optional[str] = None,
+    log_dir: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Find and load a previous session log.
+
+    Args:
+        profile: Profile name to filter by (used when session_ref is None or "last")
+        session_ref: Session reference - "last", run_id, or log filename
+        log_dir: Directory containing logs (defaults to EFFECTIVE_AGENTS_DIR/logs)
+
+    Returns:
+        Parsed log entry dict, or None if not found
+    """
+    if log_dir is None:
+        log_dir = EFFECTIVE_AGENTS_DIR / "logs"
+
+    if not log_dir.exists():
+        return None
+
+    # Get all JSON log files, sorted by name (timestamp) descending
+    log_files = sorted(log_dir.glob("*.json"), key=lambda p: p.name, reverse=True)
+
+    if not log_files:
+        return None
+
+    # If session_ref is None or "last", find most recent for this profile
+    if session_ref is None or session_ref.lower() == "last":
+        for log_file in log_files:
+            # Skip router and workflow execution logs
+            if log_file.name.startswith("router-") or "-workflow-" in log_file.name:
+                continue
+            try:
+                data = json.loads(log_file.read_text(encoding="utf-8"))
+                if data.get("profile") == profile:
+                    data["_log_file"] = str(log_file)
+                    return data
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    # If session_ref looks like a run_id (UUID format)
+    if len(session_ref) == 36 and session_ref.count("-") == 4:
+        for log_file in log_files:
+            try:
+                data = json.loads(log_file.read_text(encoding="utf-8"))
+                if data.get("run_id") == session_ref:
+                    data["_log_file"] = str(log_file)
+                    return data
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    # If session_ref is a filename
+    log_path = log_dir / session_ref
+    if not log_path.exists() and not session_ref.endswith(".json"):
+        log_path = log_dir / f"{session_ref}.json"
+
+    if log_path.exists():
+        try:
+            data = json.loads(log_path.read_text(encoding="utf-8"))
+            data["_log_file"] = str(log_path)
+            return data
+        except Exception:  # noqa: BLE001
+            return None
+
+    return None
+
+
+def build_session_context(
+    previous_session: Dict[str, Any],
+    max_chars: int = SESSION_CONTEXT_MAX_CHARS,
+) -> List[str]:
+    """
+    Build context lines from a previous session for injection into prompts.
+
+    Args:
+        previous_session: Parsed log entry from previous session
+        max_chars: Maximum characters to include
+
+    Returns:
+        List of context lines to inject
+    """
+    lines: List[str] = []
+    total_chars = 0
+
+    # Header
+    header = "# Previous Session Context"
+    lines.append(header)
+    lines.append("")
+
+    # Session metadata
+    timestamp = previous_session.get("timestamp_end", previous_session.get("timestamp_start", "unknown"))
+    profile = previous_session.get("profile", "unknown")
+    provider = previous_session.get("provider", "unknown")
+    run_id = previous_session.get("run_id", "unknown")
+    exit_code = previous_session.get("exit_code", "unknown")
+
+    meta_block = f"""## Session Info
+- Timestamp: {timestamp}
+- Profile: {profile}
+- Provider: {provider}
+- Run ID: {run_id}
+- Exit Code: {exit_code}
+"""
+    lines.append(meta_block)
+    total_chars += len(meta_block)
+
+    # Sections from previous session
+    sections = previous_session.get("sections", {})
+
+    # Plan section
+    plan = sections.get("plan", [])
+    if plan and total_chars < max_chars:
+        plan_text = "\n".join(plan[:10])  # Limit to 10 items
+        if len(plan_text) + total_chars > max_chars:
+            plan_text = plan_text[:max_chars - total_chars - 50] + "\n... (truncated)"
+        lines.append("## Previous Plan")
+        lines.append(plan_text)
+        lines.append("")
+        total_chars += len(plan_text)
+
+    # Code changes section
+    code_changes = sections.get("code changes", [])
+    if code_changes and total_chars < max_chars:
+        code_text = "\n".join(code_changes[:10])
+        if len(code_text) + total_chars > max_chars:
+            code_text = code_text[:max_chars - total_chars - 50] + "\n... (truncated)"
+        lines.append("## Previous Code Changes")
+        lines.append(code_text)
+        lines.append("")
+        total_chars += len(code_text)
+
+    # Next actions (these become the current task context)
+    next_actions = previous_session.get("next_actions", [])
+    if next_actions and total_chars < max_chars:
+        na_text = "\n".join(next_actions[:5])
+        if len(na_text) + total_chars > max_chars:
+            na_text = na_text[:max_chars - total_chars - 50] + "\n... (truncated)"
+        lines.append("## Pending Actions (from previous session)")
+        lines.append(na_text)
+        lines.append("")
+        total_chars += len(na_text)
+
+    # Delta from previous session
+    delta = previous_session.get("delta", [])
+    if delta and total_chars < max_chars:
+        delta_text = "\n".join(delta[:5])
+        if len(delta_text) + total_chars > max_chars:
+            delta_text = delta_text[:max_chars - total_chars - 50] + "\n... (truncated)"
+        lines.append("## Recent Changes")
+        lines.append(delta_text)
+        lines.append("")
+        total_chars += len(delta_text)
+
+    # Separator
+    lines.append("---")
+    lines.append("Continue from where the previous session left off.")
+    lines.append("")
+
+    return lines
+
+
+# =============================================================================
+# Phase 10: Hook System
+# =============================================================================
+# Run custom scripts/commands before and after agent execution.
+
+def run_hooks(
+    hooks: List[Dict[str, Any]],
+    hook_type: str,
+    env: Dict[str, str],
+    cwd: Path,
+    timeout: float = 30.0,
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    Execute a list of hooks.
+
+    Args:
+        hooks: List of hook configurations
+        hook_type: "pre" or "post" (for logging)
+        env: Environment variables to pass to hooks
+        cwd: Working directory for hook execution
+        timeout: Timeout per hook in seconds
+
+    Returns:
+        Tuple of (all_passed, results) where results contains hook execution details
+    """
+    results: List[Dict[str, Any]] = []
+    all_passed = True
+
+    for hook in hooks:
+        name = hook.get("name", "unnamed")
+        command = hook.get("command", "")
+        on_failure = hook.get("on_failure", "warn")  # abort | warn | ignore
+
+        if not command:
+            continue
+
+        # Expand environment variables in command
+        try:
+            expanded_cmd = os.path.expandvars(command)
+            for key, val in env.items():
+                expanded_cmd = expanded_cmd.replace(f"${{{key}}}", val)
+                expanded_cmd = expanded_cmd.replace(f"${key}", val)
+        except Exception:  # noqa: BLE001
+            expanded_cmd = command
+
+        result: Dict[str, Any] = {
+            "name": name,
+            "command": command,
+            "expanded": expanded_cmd,
+            "hook_type": hook_type,
+            "on_failure": on_failure,
+        }
+
+        try:
+            proc = subprocess.run(
+                expanded_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=cwd,
+                env={**os.environ, **env},
+                check=False,
+            )
+            result["exit_code"] = proc.returncode
+            result["stdout"] = proc.stdout[:500] if proc.stdout else ""
+            result["stderr"] = proc.stderr[:500] if proc.stderr else ""
+            result["status"] = "ok" if proc.returncode == 0 else "failed"
+
+            if proc.returncode != 0:
+                if on_failure == "abort":
+                    all_passed = False
+                    result["action"] = "abort"
+                elif on_failure == "warn":
+                    result["action"] = "warn"
+                else:
+                    result["action"] = "ignore"
+            else:
+                result["action"] = "continue"
+
+        except subprocess.TimeoutExpired:
+            result["exit_code"] = 124
+            result["status"] = "timeout"
+            result["action"] = "abort" if on_failure == "abort" else "warn"
+            if on_failure == "abort":
+                all_passed = False
+        except Exception as exc:  # noqa: BLE001
+            result["exit_code"] = 1
+            result["status"] = "error"
+            result["error"] = str(exc)
+            result["action"] = "abort" if on_failure == "abort" else "warn"
+            if on_failure == "abort":
+                all_passed = False
+
+        results.append(result)
+
+        # Stop if abort triggered
+        if result.get("action") == "abort" and on_failure == "abort":
+            break
+
+    return all_passed, results
+
+
+def get_hooks(
+    agents_cfg: Dict[str, Any],
+    profile_cfg: Dict[str, Any],
+    hook_type: str,
+) -> List[Dict[str, Any]]:
+    """
+    Get combined hooks from global and profile config.
+
+    Args:
+        agents_cfg: Global agents.yaml configuration
+        profile_cfg: Profile-specific configuration
+        hook_type: "pre" or "post"
+
+    Returns:
+        Combined list of hooks (global first, then profile-specific)
+    """
+    hooks: List[Dict[str, Any]] = []
+
+    # Global hooks
+    global_hooks = agents_cfg.get("hooks", {})
+    if hook_type in global_hooks:
+        hooks.extend(global_hooks[hook_type])
+
+    # Profile-specific hooks
+    profile_hooks = profile_cfg.get("hooks", {})
+    if hook_type in profile_hooks:
+        hooks.extend(profile_hooks[hook_type])
+
+    return hooks
+
+
+# =============================================================================
+# Phase 11: Multi-Provider Fallback
+# =============================================================================
+# Automatic failover when primary provider fails.
+
+FALLBACK_TRIGGERS = {"timeout", "cli_not_found", "exit_nonzero"}
+
+
+def get_fallback_providers(
+    profile_cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Get fallback provider configurations from profile.
+
+    Args:
+        profile_cfg: Profile configuration
+
+    Returns:
+        List of fallback provider configurations
+    """
+    return profile_cfg.get("fallback", [])
+
+
+def should_fallback(
+    exit_code: Any,
+    profile_cfg: Dict[str, Any],
+    cli_not_found: bool = False,
+) -> bool:
+    """
+    Determine if fallback should be triggered.
+
+    Args:
+        exit_code: Exit code from primary provider (int, "timeout", "interrupt")
+        profile_cfg: Profile configuration
+        cli_not_found: Whether CLI was not found
+
+    Returns:
+        True if fallback should be triggered
+    """
+    fallback_providers = get_fallback_providers(profile_cfg)
+    if not fallback_providers:
+        return False
+
+    fallback_on = set(profile_cfg.get("fallback_on", ["timeout", "cli_not_found"]))
+
+    if cli_not_found and "cli_not_found" in fallback_on:
+        return True
+
+    if exit_code == "timeout" and "timeout" in fallback_on:
+        return True
+
+    if isinstance(exit_code, int) and exit_code != 0 and "exit_nonzero" in fallback_on:
+        return True
+
+    return False
+
+
+def build_fallback_config(
+    original_cfg: Dict[str, Any],
+    fallback_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Build a merged configuration for fallback execution.
+
+    Args:
+        original_cfg: Original profile configuration
+        fallback_cfg: Fallback provider configuration
+
+    Returns:
+        Merged configuration with fallback overrides
+    """
+    merged = dict(original_cfg)
+    # Override with fallback values
+    if "provider" in fallback_cfg:
+        merged["provider"] = fallback_cfg["provider"]
+    if "command" in fallback_cfg:
+        merged["command"] = fallback_cfg["command"]
+    if "prompt" in fallback_cfg:
+        merged["prompt"] = fallback_cfg["prompt"]
+    return merged
+
+
+# =============================================================================
+# Phase 12: MCP Server Integration
+# =============================================================================
+# Connect agents to MCP (Model Context Protocol) servers for extended capabilities.
+
+def get_mcp_servers(
+    agents_cfg: Dict[str, Any],
+    profile_cfg: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """
+    Get MCP servers configured for this profile.
+
+    Args:
+        agents_cfg: Global agents.yaml configuration
+        profile_cfg: Profile-specific configuration
+
+    Returns:
+        List of MCP server configurations
+    """
+    global_mcp = agents_cfg.get("mcp", {})
+    all_servers = global_mcp.get("servers", [])
+
+    # Build server lookup by name
+    server_map = {s.get("name", ""): s for s in all_servers if s.get("name")}
+
+    # Get profile's requested servers
+    profile_mcp = profile_cfg.get("mcp", {})
+    requested_names = profile_mcp.get("servers", [])
+
+    # If profile specifies servers, filter to those
+    if requested_names:
+        return [server_map[name] for name in requested_names if name in server_map]
+
+    # If profile doesn't specify, check if all servers should be enabled
+    if profile_mcp.get("enabled", False) or global_mcp.get("auto_enable", False):
+        return [s for s in all_servers if s.get("enabled", True)]
+
+    return []
+
+
+def build_mcp_context(
+    mcp_servers: List[Dict[str, Any]],
+) -> List[str]:
+    """
+    Build MCP context lines for injection into prompts.
+
+    Args:
+        mcp_servers: List of MCP server configurations
+
+    Returns:
+        List of context lines describing available MCP capabilities
+    """
+    if not mcp_servers:
+        return []
+
+    lines: List[str] = []
+    lines.append("# MCP Server Context")
+    lines.append("")
+    lines.append("The following MCP (Model Context Protocol) servers are available:")
+    lines.append("")
+
+    for server in mcp_servers:
+        name = server.get("name", "unknown")
+        desc = server.get("description", "No description")
+        lines.append(f"- **{name}**: {desc}")
+
+    lines.append("")
+    lines.append("---")
+
+    return lines
+
+
+def get_mcp_info_for_log(
+    mcp_servers: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Get MCP server info for log entry.
+
+    Args:
+        mcp_servers: List of MCP server configurations
+
+    Returns:
+        Dict with MCP info for logging, or None if no servers
+    """
+    if not mcp_servers:
+        return None
+
+    return {
+        "servers": [s.get("name") for s in mcp_servers],
+        "count": len(mcp_servers),
+    }
+
+
+MEMORY_ROOT = EFFECTIVE_AGENTS_DIR / "memory"
+MEMORY_PROFILES = MEMORY_ROOT / "profiles"
+MEMORY_SESSIONS = MEMORY_ROOT / "sessions"
+MEMORY_WORKFLOWS = MEMORY_ROOT / "workflows"
+LAST_SESSION_FILE = MEMORY_ROOT / "last-session.md"
+SUMMARY_FILE = MEMORY_ROOT / "summary.md"
+DEFAULT_MEMORY_FILE = LAST_SESSION_FILE
+SECTION_ORDER = ["plan", "code changes", "verification", "next actions", "delta"]
+SECTION_ALIASES = {
+    "plan": ["plan"],
+    "code changes": ["code changes", "code", "changes"],
+    "verification": ["verification", "tests", "test plan"],
+    "next actions": ["next actions", "next steps", "follow-up", "action items"],
+    "delta": ["delta", "changes from previous session"],
+}
+MAX_ARTIFACTS = 25
+
+# Ensure memory directories exist (best-effort)
+for _dir in (MEMORY_ROOT, MEMORY_PROFILES, MEMORY_SESSIONS, MEMORY_WORKFLOWS):
+    try:
+        _dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+if not os.environ.get("VIRTUAL_ENV") and VENV_PY.exists() and Path(sys.executable) != VENV_PY:
+    os.execv(str(VENV_PY), [str(VENV_PY)] + sys.argv)
+
+# Handle SIGPIPE cleanly (avoid BrokenPipe on head)
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+try:
+    import yaml  # type: ignore
+except ImportError:
+    sys.stderr.write("PyYAML is required. Run ./install.sh or pip install pyyaml.\n")
+    sys.exit(1)
+
+# Use effective paths for config and logs (project-aware)
+AGENTS_FILE = EFFECTIVE_AGENTS_DIR / "agents.yaml"
+LOG_DIR = EFFECTIVE_AGENTS_DIR / "logs"
+
+
+def load_agents() -> Dict[str, Any]:
+    if not AGENTS_FILE.exists():
+        raise FileNotFoundError(f"Missing agents config: {AGENTS_FILE}")
+    with AGENTS_FILE.open("r", encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    return data
+
+
+def resolve_profile_alias(
+    profile: str,
+    agents_cfg: Dict[str, Any],
+) -> str:
+    """
+    Resolve a profile alias to the actual profile name.
+
+    Aliases can be defined in two ways:
+    1. Global aliases section:
+       aliases:
+         d: dev
+         q: quick
+
+    2. Per-profile aliases:
+       profiles:
+         dev:
+           aliases: [d, development]
+
+    Args:
+        profile: The profile name or alias
+        agents_cfg: The loaded agents.yaml configuration
+
+    Returns:
+        The resolved profile name (or original if no alias found)
+    """
+    profiles = agents_cfg.get("profiles", {})
+
+    # If it's already a valid profile, return it
+    if profile in profiles:
+        return profile
+
+    # Check global aliases section
+    global_aliases = agents_cfg.get("aliases", {})
+    if profile in global_aliases:
+        resolved = global_aliases[profile]
+        if resolved in profiles:
+            return resolved
+
+    # Check per-profile aliases
+    for profile_name, profile_cfg in profiles.items():
+        if not isinstance(profile_cfg, dict):
+            continue
+        profile_aliases = profile_cfg.get("aliases", [])
+        if isinstance(profile_aliases, list) and profile in profile_aliases:
+            return profile_name
+
+    # No alias found, return original (will fail later with proper error)
+    return profile
+
+
+def ensure_prompt(prompt_path: Path) -> None:
+    if not prompt_path.exists():
+        raise FileNotFoundError(f"Prompt file not found: {prompt_path}")
+    try:
+        if prompt_path.stat().st_size == 0:
+            raise ValueError(f"Prompt file is empty: {prompt_path}")
+    except OSError as exc:  # noqa: BLE001
+        raise FileNotFoundError(f"Unable to stat prompt: {prompt_path} ({exc})") from exc
+
+
+def _is_codex(argv0: str) -> bool:
+    try:
+        return Path(argv0).name == "codex"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_claude(argv0: str) -> bool:
+    try:
+        return Path(argv0).name == "claude"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_gemini(argv0: str) -> bool:
+    try:
+        return Path(argv0).name == "gemini"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _is_cursor_agent(argv0: str) -> bool:
+    try:
+        return Path(argv0).name == "cursor-agent"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def ensure_codex_paths(env: Dict[str, str], log: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Ensure CODEX_HOME and CODEX_SESSION_DIR are set and writable.
+    Returns (home_dir, session_dir); any None indicates failure.
+    """
+
+    def _ensure(path_str: str, label: str) -> Optional[str]:
+        try:
+            path = Path(path_str)
+            path.mkdir(parents=True, exist_ok=True)
+            test_file = path / ".write_test"
+            test_file.write_text("ok", encoding="utf-8")
+            test_file.unlink(missing_ok=True)
+            log.append(f"{label}={path_str}")
+            return path_str
+        except Exception as exc:  # noqa: BLE001
+            log.append(f"{label}_unwritable={path_str} ({exc})")
+            return None
+
+    home_dir = env.get("CODEX_HOME") or str(ROOT / ".agents" / "codex")
+    env["CODEX_HOME"] = home_dir
+    session_dir = env.get("CODEX_SESSION_DIR") or str(ROOT / ".agents" / "codex_sessions")
+    env["CODEX_SESSION_DIR"] = session_dir
+
+    home_ok = _ensure(home_dir, "codex_home")
+    session_ok = _ensure(session_dir, "codex_session_dir")
+
+    return home_ok, session_ok
+
+
+def build_command_argv(
+    template: str,
+    prompt_path: Path,
+    profile: str,
+    extra: List[str],
+    summary_prefix: Optional[str] = None,
+    workflow_context_lines: Optional[List[str]] = None,
+    project_context_lines: Optional[List[str]] = None,
+    session_context_lines: Optional[List[str]] = None,
+    mcp_context_lines: Optional[List[str]] = None,
+) -> Tuple[List[str], Optional[str], str]:
+    try:
+        cmd = template.format(prompt=str(prompt_path), profile=profile, root=str(ROOT))
+    except KeyError as exc:
+        raise ValueError(f"Command template missing placeholder: {exc}") from exc
+
+    argv = shlex.split(cmd)
+    if extra:
+        argv.extend(extra)
+
+    # Display string for logs (safe quoting)
+    cmd_display = " ".join(shlex.quote(x) for x in argv)
+
+    # Build context prefix (project + mcp + session + workflow) to inject into prompts
+    # Order: project context -> mcp context -> session context -> workflow context
+    context_prefix_parts: List[str] = []
+    if project_context_lines:
+        context_prefix_parts.append("\n".join(project_context_lines))
+    if mcp_context_lines:
+        context_prefix_parts.append("\n".join(mcp_context_lines))
+    if session_context_lines:
+        context_prefix_parts.append("\n".join(session_context_lines))
+    if workflow_context_lines:
+        context_prefix_parts.append("\n".join(workflow_context_lines))
+    context_prefix = "\n\n".join(context_prefix_parts) if context_prefix_parts else ""
+
+    # Provider-specific handling for stdin and argv construction
+    stdin_text: Optional[str] = None
+
+    # Codex: feed prompt file via stdin when command has "-"
+    if argv and _is_codex(argv[0]) and "exec" in argv and "-" in argv:
+        prompt_content = prompt_path.read_text(encoding="utf-8", errors="replace")
+        # Prepend context to prompt content for Codex
+        if context_prefix:
+            stdin_text = f"{context_prefix}\n\n{prompt_content}"
+        else:
+            stdin_text = prompt_content
+
+    # Claude: inject --system-prompt with prompt file content, pass stdin through
+    elif argv and _is_claude(argv[0]) and "-p" in argv:
+        prompt_content = prompt_path.read_text(encoding="utf-8", errors="replace").strip()
+        # Prepend context to prompt content for Claude
+        if context_prefix:
+            prompt_content = f"{context_prefix}\n\n{prompt_content}"
+        # Insert --system-prompt after -p flag
+        try:
+            p_idx = argv.index("-p")
+            argv.insert(p_idx + 1, "--system-prompt")
+            argv.insert(p_idx + 2, prompt_content)
+        except ValueError:
+            # -p not found, append at end
+            argv.extend(["--system-prompt", prompt_content])
+        # If command ends with "-", remove it and read stdin from parent process
+        if argv and argv[-1] == "-":
+            argv.pop()
+        # Read from parent's stdin to pass to Claude
+        import sys as _sys
+        if not _sys.stdin.isatty():
+            stdin_text = _sys.stdin.read()
+        else:
+            stdin_text = ""  # No stdin available
+        # Update display string after modification
+        cmd_display = " ".join(shlex.quote(x) for x in argv)
+
+    # Gemini: prepend system prompt to user query, pass as positional argument
+    elif argv and _is_gemini(argv[0]):
+        system_prompt = prompt_path.read_text(encoding="utf-8", errors="replace").strip()
+        # Prepend context to system prompt for Gemini
+        if context_prefix:
+            system_prompt = f"{context_prefix}\n\n{system_prompt}"
+        # Read user query from stdin
+        import sys as _sys
+        user_query = ""
+        if not _sys.stdin.isatty():
+            user_query = _sys.stdin.read().strip()
+        # Combine system prompt and user query
+        if user_query:
+            combined_prompt = f"{system_prompt}\n\n---\nUser query: {user_query}"
+        else:
+            combined_prompt = system_prompt
+        # Remove any existing positional prompt and add combined
+        # Gemini uses positional args after flags
+        argv.append(combined_prompt)
+        # Ensure output format is text for structured parsing
+        if "-o" not in argv and "--output-format" not in argv:
+            argv.insert(1, "-o")
+            argv.insert(2, "text")
+        stdin_text = ""  # Gemini reads from positional; empty stdin closes pipe properly
+        # Update display string after modification
+        cmd_display = " ".join(shlex.quote(x) for x in argv)
+
+    # Cursor-agent: prepend system prompt to user query, pass as positional argument
+    elif argv and _is_cursor_agent(argv[0]):
+        system_prompt = prompt_path.read_text(encoding="utf-8", errors="replace").strip()
+        # Prepend context to system prompt for Cursor-agent
+        if context_prefix:
+            system_prompt = f"{context_prefix}\n\n{system_prompt}"
+        # Read user query from stdin
+        import sys as _sys
+        user_query = ""
+        if not _sys.stdin.isatty():
+            user_query = _sys.stdin.read().strip()
+        # Combine system prompt and user query
+        if user_query:
+            combined_prompt = f"{system_prompt}\n\n---\nUser query: {user_query}"
+        else:
+            combined_prompt = system_prompt
+        # Add combined prompt as positional argument
+        argv.append(combined_prompt)
+        # Ensure print mode and text output format
+        if "-p" not in argv and "--print" not in argv:
+            argv.insert(1, "-p")
+        if "--output-format" not in argv:
+            argv.insert(2, "--output-format")
+            argv.insert(3, "text")
+        stdin_text = ""  # Cursor-agent reads from positional; empty stdin closes pipe properly
+        # Update display string after modification
+        cmd_display = " ".join(shlex.quote(x) for x in argv)
+
+    elif summary_prefix:
+        # Even if not codex/claude stdin, allow prefix when summary is requested
+        try:
+            stdin_text = prompt_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            stdin_text = ""
+
+    if summary_prefix:
+        base = stdin_text or ""
+        stdin_text = f"{summary_prefix}\n\n{base}"
+
+    # Note: Project and workflow context are now injected per-provider above
+    # (into prompt_content for Claude/Gemini/Cursor, or stdin for Codex)
+
+    return argv, stdin_text, cmd_display
+
+
+def which_command(cmd: str) -> str:
+    tokens = shlex.split(cmd)
+    if not tokens:
+        return ""
+    return tokens[0]
+
+
+def generate_run_id() -> str:
+    return str(uuid.uuid4())
+
+
+def resolve_timeout(cli_timeout: float | None) -> float:
+    if cli_timeout is not None:
+        return cli_timeout
+    env_val = os.environ.get("AGENT_TIMEOUT")
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            pass
+    return TIMEOUT_DEFAULT
+
+
+def _text(val: Any) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, bytes):
+        try:
+            return val.decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            return repr(val)
+    return str(val)
+
+
+def validate_cli(argv: List[str]) -> Optional[str]:
+    cli_binary = argv[0] if argv else ""
+    if not cli_binary:
+        raise FileNotFoundError("Command template rendered empty argv/CLI.")
+    resolved = shutil.which(cli_binary)
+    if resolved is None:
+        raise FileNotFoundError(f"CLI not found on PATH: {cli_binary}")
+    note = None
+    try:
+        proc = subprocess.run(
+            [cli_binary, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        output = (proc.stdout or proc.stderr or "").strip()
+        if output:
+            first = output.splitlines()[0][:200]
+            note = f"{cli_binary} version: {first}"
+    except Exception as exc:  # noqa: BLE001
+        note = f"{cli_binary} version check skipped: {exc}"
+    return note
+
+
+def normalize_output(
+    provider: str,
+    out_raw: str,
+    err_raw: str,
+) -> Tuple[str, str, Dict[str, Any], List[str]]:
+    """
+    Provider-agnostic output normalization (v2).
+    Returns (stdout_norm, stderr_norm, provider_meta, normalization_notes).
+    Never raises; falls back to raw output if an error occurs.
+    """
+
+    def _safe_notes_append(notes: List[str], msg: str) -> None:
+        try:
+            notes.append(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _normalize_text(val: str) -> str:
+        if not val:
+            return ""
+        return val.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+
+    def _strip_codex_banner(text: str, notes: List[str]) -> Tuple[str, bool]:
+        import re
+
+        pattern = re.compile(
+            r"^OpenAI Codex v[^\n]*\n--------\n.*?\n--------\n",
+            re.DOTALL,
+        )
+        match = pattern.match(text)
+        if match:
+            _safe_notes_append(notes, "codex banner stripped (primary pattern)")
+            return text[match.end() :], True
+
+        lines = text.splitlines(keepends=True)
+        markers = (
+            "workdir:",
+            "model:",
+            "provider:",
+            "approval:",
+            "sandbox:",
+            "reasoning effort:",
+            "reasoning summaries:",
+            "session id:",
+        )
+        start_idx = None
+        for idx, line in enumerate(lines):
+            if any(m in line for m in markers):
+                start_idx = idx
+                break
+            if line.strip() == "":
+                break
+
+        if start_idx is not None:
+            end_idx = start_idx
+            while end_idx < len(lines) and lines[end_idx].strip() != "":
+                end_idx += 1
+            _safe_notes_append(notes, "codex banner stripped (fallback markers)")
+            new_text = "".join(lines[end_idx:]).lstrip("\n")
+            return new_text, True
+
+        return text, False
+
+    def _strip_claude_metadata(text: str, notes: List[str]) -> Tuple[str, bool]:
+        lines = text.splitlines(keepends=True)
+        if not lines:
+            return text, False
+
+        metadata_keys = (
+            "model:",
+            "workspace:",
+            "project:",
+            "environment:",
+            "provider:",
+            "session id:",
+            "org:",
+            "account:",
+        )
+        idx = 0
+        hit = False
+        while idx < len(lines) and lines[idx].strip():
+            line_lower = lines[idx].lower()
+            if any(key in line_lower for key in metadata_keys):
+                hit = True
+                idx += 1
+                continue
+            hit = False
+            break
+
+        if hit:
+            while idx < len(lines) and lines[idx].strip() == "":
+                idx += 1
+            _safe_notes_append(notes, "claude metadata block stripped")
+            return "".join(lines[idx:]), True
+
+        return text, False
+
+    def _extract_field(text: str, label: str) -> Optional[str]:
+        import re
+
+        try:
+            match = re.search(label + r":\s*(.+)", text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    notes: List[str] = []
+    try:
+        stdout_norm = _normalize_text(out_raw)
+        stderr_norm = _normalize_text(err_raw)
+        banner_removed = False
+
+        session_id: Optional[str] = None
+        model: Optional[str] = None
+        workdir: Optional[str] = None
+
+        if provider == "codex":
+            pre_strip = stderr_norm
+            stderr_norm, banner_removed = _strip_codex_banner(stderr_norm, notes)
+
+            if banner_removed or any(
+                marker in pre_strip for marker in ("OpenAI Codex", "workdir:", "model:", "session id:", "thinking", "exec")
+            ):
+                merged = stdout_norm.rstrip()
+                if merged and stderr_norm:
+                    merged = merged + "\n" + stderr_norm.lstrip("\n")
+                elif not merged:
+                    merged = stderr_norm
+                stdout_norm = merged
+                stderr_norm = ""
+                if banner_removed:
+                    _safe_notes_append(notes, "codex banner removed and merged into stdout")
+                else:
+                    _safe_notes_append(notes, "codex transcript merged into stdout")
+
+            meta_source = pre_strip or stderr_norm or stdout_norm
+            session_id = _extract_field(meta_source, "session id")
+            model = _extract_field(meta_source, "model")
+            workdir = _extract_field(meta_source, "workdir")
+
+        elif provider == "claude":
+            stderr_norm, banner_removed = _strip_claude_metadata(stderr_norm, notes)
+            if banner_removed:
+                _safe_notes_append(notes, "claude leading metadata removed")
+            meta_source = stderr_norm or stdout_norm
+        else:
+            meta_source = stderr_norm or stdout_norm
+
+        provider_meta = {
+            "provider": provider,
+            "session_id": session_id,
+            "model": model,
+            "workdir": workdir,
+            "banner_removed": banner_removed,
+            "normalizer_version": "v2",
+        }
+
+        return stdout_norm, stderr_norm, provider_meta, notes
+    except Exception as exc:  # noqa: BLE001
+        fallback_meta = {
+            "provider": provider,
+            "session_id": None,
+            "model": None,
+            "workdir": None,
+            "banner_removed": False,
+            "normalizer_version": "v2",
+        }
+        return out_raw, err_raw, fallback_meta, [f"normalization error: {exc}"]
+
+
+def resolve_memory_file(agent_cfg: Dict[str, Any], profile: str) -> Path:
+    rel = agent_cfg.get("memory_file")
+    if not rel:
+        path = LAST_SESSION_FILE
+    else:
+        # Resolve memory file relative to effective root (project root or AgenticOS root)
+        path = (EFFECTIVE_ROOT / rel).resolve()
+    if not str(path).startswith(str(MEMORY_ROOT.resolve())):
+        raise ValueError(f"Memory file {path} must live under {MEMORY_ROOT}")
+    return path
+
+
+def read_memory_preview(path: Path, max_lines: int = 40) -> str:
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return ""
+    lines = text.strip().splitlines()
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    return "\n".join(["... (truncated) ..."] + lines[-max_lines:])
+
+
+def load_memory(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _clean_lines(lines: List[str]) -> List[str]:
+    cleaned: List[str] = []
+    for ln in lines:
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        if not stripped.startswith("-"):
+            stripped = "- " + stripped
+        cleaned.append(stripped)
+    return cleaned
+
+
+def dedup_preserve(seq: List[str]) -> List[str]:
+    out: List[str] = []
+    for item in seq:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def extract_structured_sections(stdout_norm: str) -> Tuple[Dict[str, List[str]], str]:
+    lines = stdout_norm.splitlines()
+    sections: Dict[str, List[str]] = {key: [] for key in SECTION_ORDER}
+    current: Optional[str] = None
+    unassigned: List[str] = []
+    drop_prefixes = (
+        "user",
+        "assistant",
+        "system",
+        "thinking",
+        "exec",
+        "/bin/zsh -lc",
+        "mcp startup",
+        "tokens used",
+        "you are the",
+        "follow security",
+        "respond with the following",
+        "reconnecting",
+        "error:",
+        "plan: max 3 verb-first bullets",
+        "implement requested changes",
+        "bulleted; include code blocks",
+        "verification: commands to run with expected results",
+    )
+
+    def _sanitize_bullet(text: str) -> str:
+        cleaned = text.lstrip("-*•").strip()
+        cleaned = cleaned.strip("*`")
+        return cleaned
+
+    for ln in lines:
+        stripped = ln.strip()
+        if not stripped:
+            continue
+        content = stripped.lstrip("-*•").strip()
+        lower = content.lower()
+        if any(lower.startswith(pref) for pref in drop_prefixes):
+            continue
+        low = lower.rstrip(":")
+        matched = None
+        for key, aliases in SECTION_ALIASES.items():
+            if low in aliases or any(low.startswith(alias) for alias in aliases):
+                matched = key
+                break
+        if matched:
+            current = matched
+            remainder = stripped.split(":", 1)[1].strip() if ":" in stripped else ""
+            if remainder:
+                sections[current].append(remainder)
+            continue
+        if current:
+            sections[current].append(ln)
+        else:
+            unassigned.append(ln)
+
+    for ln in unassigned:
+        low = ln.lower()
+        if "test" in low or "verify" in low:
+            sections["verification"].append(ln)
+        elif "next" in low and ("step" in low or "action" in low):
+            sections["next actions"].append(ln)
+        elif "code" in low or "implement" in low or "change" in low or "diff" in low:
+            sections["code changes"].append(ln)
+        else:
+            sections["plan"].append(ln)
+
+    cleaned_sections: Dict[str, List[str]] = {}
+    for key, vals in sections.items():
+        cleaned: List[str] = []
+        for v in vals:
+            v_strip = v.strip()
+            if not v_strip:
+                continue
+            content = v_strip.lstrip("-*•").strip()
+            if any(content.lower().startswith(pref) for pref in drop_prefixes):
+                continue
+            if v_strip.startswith(("-", "*", "•")) or v_strip:
+                sanitized = _sanitize_bullet(v_strip if v_strip.startswith(("-", "*", "•")) else f"- {v_strip}")
+                if sanitized:
+                    cleaned.append(f"- {sanitized}")
+        cleaned_sections[key] = cleaned
+
+    structured_lines: List[str] = []
+    for key in SECTION_ORDER:
+        cleaned = cleaned_sections.get(key, [])
+        structured_lines.append(key.title())
+        structured_lines.extend(cleaned or ["- (none)"])
+        structured_lines.append("")
+
+    structured_output = "\n".join(structured_lines).rstrip() + "\n"
+    return cleaned_sections, structured_output
+
+
+def infer_next_actions(text: str) -> List[str]:
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    bullets: List[str] = []
+    for ln in lines:
+        if ln.startswith("-") or ln.startswith("*") or ln[:2].isdigit():
+            candidate = ln
+        else:
+            candidate = f"- {ln}"
+        bullets.append(candidate)
+        if len(bullets) >= 3:
+            break
+    if not bullets:
+        return ["- (none)"]
+    return bullets
+
+
+def extract_next_actions(sections: Dict[str, List[str]], stdout_structured: str) -> List[str]:
+    next_block = sections.get("next actions") or []
+    cleaned = [ln.strip() for ln in next_block if ln.strip()]
+    if cleaned:
+        normalized = [ln if ln.startswith("-") else f"- {ln}" for ln in cleaned]
+        return dedup_preserve(normalized)[:3]
+    return infer_next_actions(stdout_structured)
+
+
+def build_excerpt(stdout_structured: str, min_lines: int = 5, max_lines: int = 15) -> List[str]:
+    lines = [ln for ln in stdout_structured.splitlines() if ln.strip()]
+    filtered = [ln for ln in lines if not ln.lower().startswith(("exec", "command", "workdir:"))]
+    excerpt = filtered[:max_lines]
+    while len(excerpt) < min_lines:
+        excerpt.append("- (none)")
+    return excerpt
+
+
+def parse_markdown_sections(text: str) -> Dict[str, str]:
+    sections: Dict[str, str] = {}
+    current: Optional[str] = None
+    buf: List[str] = []
+    for line in text.splitlines():
+        if line.strip().startswith("## "):
+            if current is not None:
+                sections[current] = "\n".join(buf).strip()
+            current = line.strip()[3:].strip().lower()
+            buf = []
+        elif current is not None:
+            buf.append(line)
+    if current is not None:
+        sections[current] = "\n".join(buf).strip()
+    return sections
+
+
+def parse_latest_entry(memory_text: str) -> Dict[str, Any]:
+    if not memory_text:
+        return {}
+    blocks = [b for b in memory_text.split("\n## ") if b.strip()]
+    if not blocks:
+        return {}
+    last_block = "## " + blocks[-1]
+    sections = parse_markdown_sections(last_block)
+    next_lines = [ln.strip() for ln in (sections.get("next actions", "") or "").splitlines() if ln.strip()]
+    return {"sections": sections, "next_actions": next_lines}
+
+
+def load_previous_snapshot(profile: str, memory_file: Path) -> Dict[str, Any]:
+    last_text = load_memory(LAST_SESSION_FILE)
+    prev_profile = None
+    for line in last_text.splitlines():
+        if line.lower().startswith("**profile:**"):
+            prev_profile = line.split(":", 1)[1].strip()
+            break
+    if prev_profile == profile:
+        parsed = parse_markdown_sections(last_text)
+        return {
+            "sections": parsed,
+            "next_actions": [ln.strip() for ln in (parsed.get("next actions", "") or "").splitlines() if ln.strip()],
+        }
+
+    mem_text = load_memory(memory_file)
+    return parse_latest_entry(mem_text)
+
+
+def compute_delta(
+    previous: Dict[str, Any],
+    current_sections: Dict[str, List[str]],
+    current_next: List[str],
+) -> List[str]:
+    if not previous:
+        return ["- First recorded session for this profile."]
+
+    deltas: List[str] = []
+    prev_sections = previous.get("sections") or {}
+    prev_next = previous.get("next_actions") or []
+
+    for key in SECTION_ORDER:
+        prev_block = (prev_sections.get(key) or "").strip()
+        curr_block = "\n".join(current_sections.get(key, []))
+        if not prev_block and curr_block:
+            deltas.append(f"- {key.title()}: added details.")
+        elif prev_block and not curr_block:
+            deltas.append(f"- {key.title()}: now empty.")
+        elif prev_block and curr_block and prev_block != curr_block:
+            deltas.append(f"- {key.title()}: updated.")
+        if len(deltas) >= 4:
+            break
+
+    if prev_next != current_next and current_next:
+        deltas.append("- Next actions refreshed.")
+
+    if not deltas:
+        deltas.append("- No major changes detected.")
+    return deltas[:5]
+
+
+def write_log(entry: Dict[str, Any]) -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
+    profile = entry.get("profile", "unknown")
+    filename = f"{timestamp}-{profile}.json"
+    path = LOG_DIR / filename
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(entry, fh, indent=2)
+    return path
+
+
+def render_section(title: str, lines: List[str]) -> str:
+    block = lines or ["- (none)"]
+    return "\n".join([title] + block)
+
+
+def update_memory_files(
+    profile: str,
+    provider: str,
+    memory_file: Path,
+    finished: str,
+    cmd: str,
+    result: subprocess.CompletedProcess[str],
+    sections: Dict[str, List[str]],
+    next_actions: List[str],
+    artifacts: List[str],
+    log_name: str,
+    tags: List[str],
+    delta_lines: List[str],
+) -> List[Path]:
+    touched: List[Path] = []
+    summary_line = ""
+    if result.stdout:
+        summary_line = result.stdout.strip().splitlines()[0][:300]
+
+    date_part = finished.split("T")[0]
+    time_part = finished.split("T")[1].replace("Z", "")
+
+    memory_file.parent.mkdir(parents=True, exist_ok=True)
+    tags_text = ", ".join(tags) if tags else "(none)"
+
+    profile_entry = textwrap.dedent(
+        f"""
+        ## {finished}
+        - Provider: {provider}
+        - Command: {cmd}
+        - Exit code: {result.returncode}
+        - Log: {log_name}
+        - Tags: {tags_text}
+        - Notes: {summary_line or 'No summary available.'}
+
+        {render_section('Plan', sections.get('plan', []))}
+
+        {render_section('Code changes', sections.get('code changes', []))}
+
+        {render_section('Verification', sections.get('verification', []))}
+
+        {render_section('Next actions', next_actions)}
+
+        {render_section('Artifacts touched', [f"- {a}" for a in artifacts] or ['- (none)'])}
+
+        {render_section('Delta', delta_lines)}
+        """
+    ).strip()
+
+    try:
+        with memory_file.open("a", encoding="utf-8") as fh:
+            fh.write(profile_entry + "\n\n")
+        touched.append(memory_file)
+    except Exception:
+        pass
+
+    sessions_path = MEMORY_SESSIONS / f"{date_part}-{profile}.md"
+    try:
+        sessions_path.parent.mkdir(parents=True, exist_ok=True)
+        session_entry = textwrap.dedent(
+            f"""
+            ### {time_part}Z — {profile}
+            - Provider: {provider}
+            - Exit: {result.returncode}
+            - Tags: {tags_text}
+            - Log: {log_name}
+
+            {render_section('Plan', sections.get('plan', []))}
+
+            {render_section('Code changes', sections.get('code changes', []))}
+
+            {render_section('Verification', sections.get('verification', []))}
+
+            {render_section('Next actions', next_actions)}
+
+            {render_section('Artifacts touched', [f"- {a}" for a in artifacts] or ['- (none)'])}
+
+            {render_section('Delta', delta_lines)}
+            """
+        ).strip()
+        with sessions_path.open("a", encoding="utf-8") as fh:
+            fh.write(session_entry + "\n\n")
+        touched.append(sessions_path)
+    except Exception:
+        pass
+
+    artifacts_block = "\n".join(f"- {a}" for a in artifacts) or "- (none)"
+    last_session = textwrap.dedent(
+        f"""
+        # AgenticOS — Last Session
+
+        **Timestamp:** {finished}
+        **Profile:** {profile}
+        **Provider:** {provider}
+        **Tags:** {tags_text}
+
+        ## Summary
+        - Command: {cmd}
+        - Exit code: {result.returncode}
+        - Log: {log_name}
+        - Notes: {summary_line or 'No summary available.'}
+
+        ## Plan
+        {chr(10).join(sections.get('plan', []) or ['- (none)'])}
+
+        ## Code changes
+        {chr(10).join(sections.get('code changes', []) or ['- (none)'])}
+
+        ## Verification
+        {chr(10).join(sections.get('verification', []) or ['- (none)'])}
+
+        ## Next actions
+        {chr(10).join(next_actions) if next_actions else "- (none)"}
+
+        ## Artifacts touched
+        {artifacts_block}
+
+        ## Delta
+        {chr(10).join(delta_lines) if delta_lines else "- (none)"}
+        """
+    ).strip()
+    try:
+        with LAST_SESSION_FILE.open("w", encoding="utf-8") as fh:
+            fh.write(last_session + "\n")
+        touched.append(LAST_SESSION_FILE)
+    except Exception:
+        pass
+
+    return touched
+
+
+def get_artifacts_touched(root: Path, log_path: Optional[Path], extra_paths: Optional[List[Path]] = None) -> List[str]:
+    artifacts: List[str] = []
+    extra_paths = extra_paths or []
+    if log_path:
+        extra_paths.append(log_path)
+    git_bin = shutil.which("git")
+    if git_bin:
+        try:
+            inside = subprocess.run(
+                [git_bin, "rev-parse", "--is-inside-work-tree"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if inside.returncode == 0 and inside.stdout.strip().lower() == "true":
+                status = subprocess.run(
+                    [git_bin, "status", "--porcelain"],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if status.returncode == 0:
+                    paths: List[str] = []
+                    for line in status.stdout.splitlines():
+                        if not line.strip():
+                            continue
+                        if len(line) >= 3:
+                            paths.append(line[3:].strip())
+                    for p in dedup_preserve(paths)[:MAX_ARTIFACTS]:
+                        try:
+                            artifacts.append(Path(p).as_posix())
+                        except Exception:  # noqa: BLE001
+                            artifacts.append(p)
+        except Exception:  # noqa: BLE001
+            pass
+
+    for path in extra_paths:
+        if not path:
+            continue
+        posix = str(Path(path))
+        if posix not in artifacts:
+            artifacts.append(posix)
+
+    if not artifacts and log_path:
+        artifacts.append(str(log_path))
+    return artifacts
+
+
+def get_git_deltas(root: Path) -> Tuple[List[str], List[str]]:
+    """
+    Extract file-name-only deltas from git diff (unstaged and staged).
+    Returns (delta_lines, delta_sources).
+    Silently returns empty if not in a git repo or git not available.
+    """
+    delta_lines: List[str] = []
+    delta_sources: List[str] = []
+    git_bin = shutil.which("git")
+    if not git_bin:
+        return delta_lines, delta_sources
+
+    try:
+        # Check if inside a git repo
+        inside = subprocess.run(
+            [git_bin, "rev-parse", "--is-inside-work-tree"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if inside.returncode != 0 or inside.stdout.strip().lower() != "true":
+            return delta_lines, delta_sources
+
+        # Get unstaged changes
+        unstaged = subprocess.run(
+            [git_bin, "diff", "--name-only"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if unstaged.returncode == 0 and unstaged.stdout.strip():
+            unstaged_files = [f.strip() for f in unstaged.stdout.splitlines() if f.strip()]
+            if unstaged_files:
+                delta_lines.append("- Git unstaged files:")
+                for f in unstaged_files[:20]:  # Limit to 20 files
+                    delta_lines.append(f"  - {f}")
+                delta_sources.append("git-unstaged")
+
+        # Get staged changes
+        staged = subprocess.run(
+            [git_bin, "diff", "--name-only", "--staged"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if staged.returncode == 0 and staged.stdout.strip():
+            staged_files = [f.strip() for f in staged.stdout.splitlines() if f.strip()]
+            if staged_files:
+                delta_lines.append("- Git staged files:")
+                for f in staged_files[:20]:  # Limit to 20 files
+                    delta_lines.append(f"  - {f}")
+                delta_sources.append("git-staged")
+
+    except Exception:  # noqa: BLE001
+        # Silently fail if git commands error out
+        pass
+
+    return delta_lines, delta_sources
+
+
+def append_summary(
+    profile: str,
+    provider: str,
+    finished: str,
+    exit_code: Any,
+    stdout_structured: str,
+    log_name: str,
+    artifacts: List[str],
+    next_actions: List[str],
+    delta_lines: List[str],
+    tags: List[str],
+) -> None:
+    """Append a compact summary entry to summary.md (best-effort)."""
+    try:
+        SUMMARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        excerpt_lines = build_excerpt(stdout_structured)
+        excerpt = "\n".join(excerpt_lines[:15])
+        artifacts_block = "\n".join(f"- {a}" for a in artifacts) or "- (none)"
+        decisions = []
+        for ln in excerpt_lines:
+            low = ln.lower()
+            if any(tok in low for tok in ("decided", "decision", "choose")):
+                decisions.append(f"- {ln.strip()}")
+        if not decisions and next_actions:
+            decisions.append(f"- next actions set ({len(next_actions)} items)")
+        if not decisions:
+            decisions.append("- (none detected)")
+        delta_block = "\n".join(delta_lines) if delta_lines else "- (none)"
+        entry = (
+            f"## {finished} — {profile}\n"
+            f"- provider: {provider}\n"
+            f"- exit: {exit_code}\n"
+            f"- log: {log_name}\n"
+            f"- tags: {', '.join(tags) if tags else '(none)'}\n"
+            "- excerpt:\n"
+            f"{excerpt or '(no excerpt)'}\n"
+            "- decisions:\n"
+            f"{chr(10).join(decisions)}\n"
+            "- next actions:\n"
+            f"{chr(10).join(next_actions) if next_actions else '- (none)'}\n"
+            "- delta:\n"
+            f"{delta_block}\n"
+            "- artifacts:\n"
+            f"{artifacts_block}\n\n"
+        )
+        with SUMMARY_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(entry)
+    except Exception:
+        # Never block execution on summary append
+        pass
+
+
+def run_profile(
+    profile: str,
+    extra_args: List[str],
+    timeout: float | None,
+    use_memory: bool,
+    normalize: bool,
+    print_mode: str,
+    tags: List[str],
+    delta_from_git: bool = False,
+    output_format: str = "text",
+    continue_session: Optional[str] = None,
+    quiet: bool = False,
+    _fallback_attempt: int = 0,
+    _fallback_cfg: Optional[Dict[str, Any]] = None,
+) -> int:
+    run_id = generate_run_id()
+    agents = load_agents()
+
+    # Resolve profile alias to actual profile name
+    original_profile = profile
+    profile = resolve_profile_alias(profile, agents)
+
+    profiles = agents.get("profiles", {})
+    if profile not in profiles:
+        if original_profile != profile:
+            raise KeyError(f"Profile alias '{original_profile}' resolved to '{profile}' but not found in {AGENTS_FILE}")
+        raise KeyError(f"Profile '{profile}' not found in {AGENTS_FILE}")
+
+    agent_cfg = profiles[profile] or {}
+
+    # Phase 11: Apply fallback config if provided
+    if _fallback_cfg is not None:
+        agent_cfg = build_fallback_config(agent_cfg, _fallback_cfg)
+
+    template = agent_cfg.get("command")
+    prompt_rel = agent_cfg.get("prompt")
+    provider = agent_cfg.get("provider", "unknown")
+    memory_file = resolve_memory_file(agent_cfg, profile)
+    auto_tags = [
+        f"profile:{profile}",
+        f"provider:{provider}",
+        f"print:{print_mode}",
+        f"memory:{'on' if use_memory else 'off'}",
+        f"normalize:{'on' if normalize else 'off'}",
+    ]
+    # Phase 11: Add fallback tag if this is a fallback attempt
+    if _fallback_attempt > 0:
+        auto_tags.append(f"fallback:{_fallback_attempt}")
+    tags = dedup_preserve((tags or []) + auto_tags)
+
+    if not template or not prompt_rel:
+        raise ValueError(f"Profile '{profile}' must define 'command' and 'prompt'")
+
+    # Resolve prompt path relative to effective root (project root or AgenticOS root)
+    prompt_path = (EFFECTIVE_ROOT / prompt_rel).resolve()
+    ensure_prompt(prompt_path)
+
+    memory_text = ""
+    memory_preview = ""
+    use_memory_preview = use_memory and print_mode != "summary" and not quiet
+    if use_memory_preview and memory_file:
+        memory_text = load_memory(memory_file)
+        memory_preview = read_memory_preview(memory_file)
+        if memory_preview:
+            print("── AgenticOS memory ─────────────────────────────")
+            print(memory_preview)
+            print("─────────────────────────────────────────────────")
+
+    # Read run_id from environment (set by router)
+    run_id = os.environ.get("AGENTICSEC_RUN_ID")
+
+    # Workflow context from environment
+    workflow_name = os.environ.get("WORKFLOW")
+    workflow_step = os.environ.get("WORKFLOW_STEP")
+    workflow_context_lines: List[str] = []
+
+    if workflow_name:
+        # Use effective agents dir for workflow memory (project-aware)
+        workflow_mem_file = EFFECTIVE_AGENTS_DIR / "memory" / "workflows" / f"{workflow_name}.md"
+        if workflow_mem_file.exists():
+            try:
+                wf_content = workflow_mem_file.read_text(encoding="utf-8")
+                workflow_context_lines = [
+                    f"# Workflow Context: {workflow_name}",
+                    f"# Current Step: {workflow_step or 'unknown'}",
+                    f"# Previous workflow state:",
+                    wf_content[-2000:] if len(wf_content) > 2000 else wf_content,  # Last 2000 chars
+                ]
+            except Exception:
+                pass
+
+    # Phase 3: Load project context (only in project mode)
+    project_context_lines: List[str] = []
+    if PROJECT_ROOT is not None:
+        max_chars = agents.get("context", {}).get("max_chars", DEFAULT_CONTEXT_MAX_CHARS)
+        project_context_lines = load_project_context(
+            agents,
+            agent_cfg,
+            EFFECTIVE_ROOT,
+            max_chars=max_chars,
+        )
+
+    # Phase 9: Session Continuity
+    session_context_lines: List[str] = []
+    parent_session_id: Optional[str] = None
+    parent_session_file: Optional[str] = None
+
+    if continue_session is not None:
+        # Find and load previous session
+        previous_session = find_previous_session(
+            profile=profile,
+            session_ref=continue_session if continue_session != "last" else None,
+            log_dir=LOG_DIR,
+        )
+        if previous_session:
+            parent_session_id = previous_session.get("run_id")
+            parent_session_file = previous_session.get("_log_file")
+            session_context_lines = build_session_context(previous_session)
+
+            # Add continuation tag
+            tags = dedup_preserve(tags + ["session:continued"])
+
+            if print_mode != "summary" and not quiet:
+                prev_ts = previous_session.get("timestamp_end", previous_session.get("timestamp_start", "unknown"))
+                print(f"── Continuing from session ──────────────────────")
+                print(f"   Previous: {prev_ts}")
+                print(f"   Run ID: {parent_session_id or 'unknown'}")
+                if previous_session.get("next_actions"):
+                    print(f"   Pending actions: {len(previous_session['next_actions'])}")
+                print("─────────────────────────────────────────────────")
+        else:
+            if print_mode != "summary" and not quiet:
+                print(f"[WARN] No previous session found for profile '{profile}'", file=sys.stderr)
+
+    # Phase 12: MCP Server Integration
+    mcp_servers = get_mcp_servers(agents, agent_cfg)
+    mcp_context_lines = build_mcp_context(mcp_servers)
+    mcp_info = get_mcp_info_for_log(mcp_servers)
+
+    summary_prefix = None
+    if print_mode == "summary":
+        summary_prefix = None
+
+    argv, stdin_text, cmd_display = build_command_argv(template, prompt_path, profile, extra_args, summary_prefix=summary_prefix, workflow_context_lines=workflow_context_lines, project_context_lines=project_context_lines, session_context_lines=session_context_lines, mcp_context_lines=mcp_context_lines)
+    cli_version_note = validate_cli(argv)
+
+    timeout_val = resolve_timeout(timeout)
+    started = dt.datetime.now(dt.UTC).isoformat() + "Z"
+    previous_snapshot = load_previous_snapshot(profile, memory_file)
+    proc: Optional[subprocess.Popen[str]] = None
+    log_notes: List[str] = []
+
+    # Phase 10: Pre-hooks
+    pre_hooks = get_hooks(agents, agent_cfg, "pre")
+    pre_hook_results: List[Dict[str, Any]] = []
+    if pre_hooks:
+        hook_env = {
+            "AGENTICOS_PROFILE": profile,
+            "AGENTICOS_PROVIDER": provider,
+            "AGENTICOS_RUN_ID": run_id or "",
+            "AGENTICOS_CWD": str(EFFECTIVE_ROOT),
+        }
+        pre_passed, pre_hook_results = run_hooks(pre_hooks, "pre", hook_env, EFFECTIVE_ROOT)
+        if not pre_passed:
+            # Pre-hook aborted - log and return
+            finished = dt.datetime.now(dt.UTC).isoformat() + "Z"
+            log_entry = {
+                "timestamp_start": started,
+                "timestamp_end": finished,
+                "run_id": run_id,
+                "profile": profile,
+                "provider": provider,
+                "exit_code": 3,
+                "status": "pre_hook_abort",
+                "pre_hooks": pre_hook_results,
+                "tags": tags + ["hook:pre_abort"],
+            }
+            write_log(log_entry)
+            if not quiet:
+                print(f"[ABORT] Pre-hook failed. See log for details.", file=sys.stderr)
+            return 3
+
+    try:
+        env = os.environ.copy()
+        if provider == "codex":
+            home_dir, session_dir = ensure_codex_paths(env, log_notes)
+            if not home_dir or not session_dir:
+                print(
+                    "ERROR: Codex paths not writable. "
+                    "Set CODEX_HOME/CODEX_SESSION_DIR to writable paths or fix permissions under .agents/codex/.agents/codex_sessions.",
+                    file=sys.stderr,
+                )
+                return 2
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE if stdin_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=EFFECTIVE_ROOT,  # Use project root when in project mode
+            env=env,
+        )
+        out, err = proc.communicate(input=stdin_text, timeout=timeout_val)
+        finished = dt.datetime.now(dt.UTC).isoformat() + "Z"
+        stdout_raw = _text(out)
+        stderr_raw = _text(err)
+        returncode = proc.returncode or 0
+
+        if normalize:
+            stdout_norm_base, stderr_norm, provider_meta, normalization_notes = normalize_output(provider, stdout_raw, stderr_raw)
+        else:
+            stdout_norm_base, stderr_norm = stdout_raw, stderr_raw
+            provider_meta = {
+                "provider": provider,
+                "session_id": None,
+                "model": None,
+                "workdir": None,
+                "banner_removed": False,
+                "normalizer_version": "v2",
+            }
+            normalization_notes = ["normalization disabled"]
+        if provider == "codex":
+            provider_meta["session_dir"] = env.get("CODEX_SESSION_DIR")
+            provider_meta["codex_home"] = env.get("CODEX_HOME")
+
+        sections, stdout_structured = extract_structured_sections(stdout_norm_base)
+        next_actions = extract_next_actions(sections, stdout_structured)
+
+        # Combine delta from multiple sources
+        delta_sources: List[str] = []
+        delta_lines: List[str] = []
+
+        # Source 1: Output delta section
+        output_delta = sections.get("delta", [])
+        if output_delta and any(line.strip() for line in output_delta):
+            delta_lines.extend(output_delta)
+            delta_sources.append("output")
+
+        # Source 2: Computed delta (comparison with previous session)
+        computed_delta = compute_delta(previous_snapshot, sections, next_actions)
+        if computed_delta:
+            if delta_lines:
+                delta_lines.append("- Session comparison:")
+            delta_lines.extend(computed_delta)
+            if "output" not in delta_sources:
+                delta_sources.append("computed")
+
+        # Source 3: Git deltas (if requested)
+        if delta_from_git:
+            git_delta_lines, git_delta_sources = get_git_deltas(EFFECTIVE_ROOT)
+            if git_delta_lines:
+                delta_lines.extend(git_delta_lines)
+                delta_sources.extend(git_delta_sources)
+
+        # Fallback if no deltas found
+        if not delta_lines:
+            delta_lines = computed_delta if computed_delta else ["- First recorded session for this profile."]
+            if not delta_sources:
+                delta_sources = ["computed"]
+
+        stdout_for_result = stdout_structured
+        stderr_for_result = stderr_norm
+
+        display_map = {
+            "norm": stdout_structured,
+            "raw": stdout_raw,
+            "plan": render_section("Plan", sections.get("plan", [])),
+            "code": render_section("Code changes", sections.get("code changes", [])),
+            "verification": render_section("Verification", sections.get("verification", [])),
+            "next-actions": render_section("Next actions", next_actions),
+            "summary": "\n".join(build_excerpt(stdout_structured, min_lines=3, max_lines=8)),
+            "delta": render_section("Delta", delta_lines),
+        }
+
+        if print_mode == "summary":
+            import re
+
+            # Phase 5: Hardened summary output - EXACTLY 3 lines starting with "- "
+            # Extract only from Plan section, no fallback to arbitrary lines
+            lines = stdout_structured.splitlines() if stdout_structured else []
+
+            # Pattern to skip meta/transcript lines
+            skip_pattern = re.compile(
+                r"^(user|assistant|system|mcp startup|thinking|exec|codex|tokens used|"
+                r"workdir|model:|provider:|approval:|sandbox:|session id|you are the|"
+                r"plan|code changes|verification|next actions|delta|none)\b",
+                re.IGNORECASE,
+            )
+
+            def _is_plan_header(line: str) -> bool:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("-"):
+                    return False
+                normalized = stripped.lstrip("#").strip()
+                normalized = normalized.strip("* ").rstrip(":").strip()
+                return normalized.lower().startswith("plan")
+
+            def _is_stop_line(text: str) -> bool:
+                if text == "":
+                    return True
+                if text.startswith("#"):
+                    return True
+                if text.lower().startswith("==") or text.lower().endswith("=="):
+                    return True
+                # Stop at next section header
+                if not text.startswith(("-", "*", "•")) and len(text) < 80 and text.endswith(":"):
+                    return True
+                return False
+
+            def _keep_bullet(raw: str) -> Optional[str]:
+                """Extract clean bullet text, returning None if should be skipped."""
+                if not raw.startswith(("-", "*", "•")):
+                    return None
+                clean = raw.lstrip("-*•").strip().strip("*`")
+                if not clean:
+                    return None
+                # Skip meta lines and (none) placeholders
+                if skip_pattern.match(clean):
+                    return None
+                if clean.lower() == "(none)":
+                    return None
+                return "- " + clean
+
+            bullets: List[str] = []
+
+            # Primary: Extract from Plan section only
+            plan_idx = next((i for i, ln in enumerate(lines) if _is_plan_header(ln)), None)
+            if plan_idx is not None:
+                for ln in lines[plan_idx + 1 :]:
+                    stripped = ln.strip()
+                    if _is_stop_line(stripped):
+                        break
+                    kept = _keep_bullet(stripped)
+                    if kept:
+                        bullets.append(kept)
+                        if len(bullets) >= 3:
+                            break
+
+            # Fallback: If no Plan section found, try Next Actions section
+            if not bullets:
+                na_idx = next(
+                    (i for i, ln in enumerate(lines) if ln.strip().lower().rstrip(":").strip("# ") in ("next actions", "next steps")),
+                    None,
+                )
+                if na_idx is not None:
+                    for ln in lines[na_idx + 1 :]:
+                        stripped = ln.strip()
+                        if _is_stop_line(stripped):
+                            break
+                        kept = _keep_bullet(stripped)
+                        if kept:
+                            bullets.append(kept)
+                            if len(bullets) >= 3:
+                                break
+
+            # Error fallback: If still empty and there were errors
+            if not bullets and returncode != 0:
+                bullets = [
+                    f"- Status: exit {returncode} (provider={provider})",
+                    "- Errors/Warnings: see log for details",
+                    "- Next step: rerun with --print norm",
+                ]
+
+            # Pad to exactly 3 bullets
+            while len(bullets) < 3:
+                bullets.append("- (no additional summary)")
+
+            # Output EXACTLY 3 lines, each starting with "- "
+            stdout_to_print = "\n".join(bullets[:3])
+            stderr_to_print = ""
+        elif print_mode == "clean":
+            import re
+
+            # Clean mode: Extract just the answer, strip section headers and formatting
+            lines = stdout_structured.splitlines() if stdout_structured else []
+
+            # Section headers to skip (anywhere in output)
+            section_headers = re.compile(
+                r"^(#{1,3}\s*)?(plan|code changes?|verification|next actions?|next steps?|delta|summary)(\s*:?\s*)?$",
+                re.IGNORECASE,
+            )
+
+            # Placeholder lines to skip (anywhere in output)
+            placeholder_lines = re.compile(
+                r"^\s*-?\s*\((none|no .+)\)\s*$",
+                re.IGNORECASE,
+            )
+
+            clean_lines = []
+            for line in lines:
+                stripped = line.strip()
+                # Skip section headers
+                if section_headers.match(stripped):
+                    continue
+                # Skip (none) and (no ...) placeholders everywhere
+                if placeholder_lines.match(stripped):
+                    continue
+                # Skip empty lines at start only
+                if not stripped and not clean_lines:
+                    continue
+                clean_lines.append(line)
+
+            # Remove trailing empty lines
+            while clean_lines and not clean_lines[-1].strip():
+                clean_lines.pop()
+
+            stdout_to_print = "\n".join(clean_lines)
+            stderr_to_print = ""
+        else:
+            stdout_to_print = display_map.get(print_mode, stdout_structured)
+            stderr_to_print = "" if print_mode in display_map and print_mode != "raw" else stderr_raw
+
+        result = subprocess.CompletedProcess(argv, returncode, stdout=stdout_for_result, stderr=stderr_for_result)
+
+        # Phase 10: Post-hooks
+        post_hooks = get_hooks(agents, agent_cfg, "post")
+        post_hook_results: List[Dict[str, Any]] = []
+        if post_hooks:
+            hook_env = {
+                "AGENTICOS_PROFILE": profile,
+                "AGENTICOS_PROVIDER": provider,
+                "AGENTICOS_RUN_ID": run_id or "",
+                "AGENTICOS_CWD": str(EFFECTIVE_ROOT),
+                "AGENTICOS_EXIT_CODE": str(result.returncode),
+                "AGENTICOS_TIMESTAMP": finished,
+            }
+            _, post_hook_results = run_hooks(post_hooks, "post", hook_env, EFFECTIVE_ROOT)
+
+        log_entry = {
+            "timestamp_start": started,
+            "timestamp_end": finished,
+            "run_id": run_id,
+            "profile": profile,
+            "provider": provider,
+            "prompt": str(prompt_path),
+            "command": cmd_display,
+            "argv": argv,
+            "cwd": str(EFFECTIVE_ROOT),
+            "project_mode": PROJECT_ROOT is not None,
+            "project_root": str(PROJECT_ROOT) if PROJECT_ROOT else None,
+            "exit_code": result.returncode,
+            "stdout": stdout_structured,
+            "stderr": stderr_norm,
+            "run_id": run_id,
+            "stdout_raw": stdout_raw,
+            "stderr_raw": stderr_raw,
+            "stdout_norm": stdout_structured,
+            "stdout_norm_base": stdout_norm_base,
+            "stderr_norm": stderr_norm,
+            "provider_meta": provider_meta,
+            "normalization_notes": normalization_notes,
+            "extra_args": extra_args,
+            "timeout_seconds": timeout_val,
+            "memory_file": str(memory_file) if memory_file else None,
+            "memory_preview": memory_preview[:500] if memory_preview else "",
+            "sections": sections,
+            "next_actions": next_actions,
+            "delta": delta_lines,
+            "delta_sources": delta_sources,
+            "tags": tags,
+            "cli_version_note": cli_version_note,
+            "workflow_name": workflow_name or None,
+            "workflow_step": workflow_step or None,
+            "workflow_context_injected": bool(workflow_context_lines),
+            "parent_session_id": parent_session_id,
+            "parent_session_file": parent_session_file,
+            "session_context_injected": bool(session_context_lines),
+            "session_dir": env.get("CODEX_SESSION_DIR") if provider == "codex" else None,
+            "run_id": run_id,
+            "log_notes": log_notes,
+            "pre_hooks": pre_hook_results if pre_hook_results else None,
+            "post_hooks": post_hook_results if post_hook_results else None,
+            "mcp": mcp_info,
+        }
+        log_path = write_log(log_entry)
+        planned_memory_paths: List[Path] = []
+        if use_memory and memory_file:
+            date_part = finished.split("T")[0]
+            planned_memory_paths = [
+                memory_file,
+                MEMORY_SESSIONS / f"{date_part}-{profile}.md",
+                LAST_SESSION_FILE,
+                SUMMARY_FILE,
+            ]
+        artifacts = get_artifacts_touched(EFFECTIVE_ROOT, log_path, planned_memory_paths)
+        if use_memory and memory_file:
+            try:
+                touched = update_memory_files(
+                    profile,
+                    provider,
+                    memory_file,
+                    finished,
+                    cmd_display,
+                    result,
+                    sections,
+                    next_actions,
+                    artifacts,
+                    log_path.name,
+                    tags,
+                    delta_lines,
+                )
+                planned_memory_paths.extend(touched)
+            except Exception as mem_exc:  # noqa: BLE001
+                stderr_for_result = (stderr_for_result or "") + ("\n" if stderr_for_result else "") + f"[AgenticOS memory error] {mem_exc}"
+                stderr_norm = stderr_for_result
+
+        # Update workflow memory with execution results
+        if workflow_name and sections:
+            try:
+                # Use effective agents dir for workflow memory (project-aware)
+                wf_mem = EFFECTIVE_AGENTS_DIR / "memory" / "workflows" / f"{workflow_name}.md"
+                step_summary = f"Step '{workflow_step or 'unknown'}' completed with profile '{profile}'"
+                step_next = next_actions[:3] if next_actions else []
+
+                # Append to workflow memory
+                now = dt.datetime.now(dt.UTC).isoformat() + "Z"
+                wf_mem.parent.mkdir(parents=True, exist_ok=True)
+
+                with wf_mem.open("a", encoding="utf-8") as wf_fh:
+                    wf_fh.write(f"\n## {now}\n")
+                    wf_fh.write(f"- Step: {workflow_step or 'unknown'}\n")
+                    wf_fh.write(f"- Profile: {profile}\n")
+                    wf_fh.write(f"- Summary: {step_summary}\n")
+                    wf_fh.write(f"- Plan excerpt:\n")
+                    for pl in (sections.get("plan", [])[:3]):
+                        wf_fh.write(f"  {pl}\n")
+                    wf_fh.write(f"- Next actions:\n")
+                    for na in step_next:
+                        wf_fh.write(f"  {na}\n")
+                    wf_fh.write("\n")
+            except Exception:  # noqa: BLE001
+                # Never block execution on workflow memory update
+                pass
+
+        append_summary(
+            profile,
+            provider,
+            finished,
+            result.returncode,
+            stdout_structured,
+            log_path.name,
+            artifacts,
+            next_actions,
+            delta_lines,
+            tags,
+        )
+
+        # Phase 5: Structured output format
+        if output_format == "json":
+            json_output = {
+                "status": "success",
+                "exit_code": result.returncode,
+                "profile": profile,
+                "provider": provider,
+                "run_id": run_id,
+                "timestamp": finished,
+                "sections": sections,
+                "next_actions": next_actions,
+                "delta": delta_lines,
+                "tags": tags,
+                "log_file": str(log_path),
+                "workflow_name": workflow_name or None,
+                "workflow_step": workflow_step or None,
+            }
+            print(json.dumps(json_output, indent=2))
+        else:
+            if stdout_to_print:
+                print(stdout_to_print)
+            if stderr_to_print:
+                print(stderr_to_print, file=sys.stderr)
+        return result.returncode
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                out, err = proc.communicate(timeout=2)
+            except Exception:  # noqa: BLE001
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+                out, err = ("", "")
+
+        finished = dt.datetime.now(dt.UTC).isoformat() + "Z"
+        stdout_raw = _text(out) if "out" in locals() else ""
+        stderr_raw = _text(err) if "err" in locals() else ""
+
+        if normalize:
+            stdout_norm_base, stderr_norm, provider_meta, normalization_notes = normalize_output(provider, stdout_raw, stderr_raw)
+        else:
+            stdout_norm_base, stderr_norm = stdout_raw, stderr_raw
+            provider_meta = {
+                "provider": provider,
+                "session_id": None,
+                "model": None,
+                "workdir": None,
+                "banner_removed": False,
+                "normalizer_version": "v2",
+            }
+            normalization_notes = ["normalization disabled"]
+
+        sections, stdout_structured = extract_structured_sections(stdout_norm_base)
+        next_actions = extract_next_actions(sections, stdout_structured)
+
+        # Combine delta from multiple sources
+        delta_sources: List[str] = []
+        delta_lines: List[str] = []
+        output_delta = sections.get("delta", [])
+        if output_delta and any(line.strip() for line in output_delta):
+            delta_lines.extend(output_delta)
+            delta_sources.append("output")
+        computed_delta = compute_delta(previous_snapshot, sections, next_actions)
+        if computed_delta:
+            if delta_lines:
+                delta_lines.append("- Session comparison:")
+            delta_lines.extend(computed_delta)
+            if "output" not in delta_sources:
+                delta_sources.append("computed")
+        if delta_from_git:
+            git_delta_lines, git_delta_sources = get_git_deltas(EFFECTIVE_ROOT)
+            if git_delta_lines:
+                delta_lines.extend(git_delta_lines)
+                delta_sources.extend(git_delta_sources)
+        if not delta_lines:
+            delta_lines = computed_delta if computed_delta else ["- First recorded session for this profile."]
+            if not delta_sources:
+                delta_sources = ["computed"]
+
+        log_entry = {
+            "timestamp_start": started,
+            "timestamp_end": finished,
+            "run_id": run_id,
+            "profile": profile,
+            "provider": provider,
+            "prompt": str(prompt_path),
+            "command": cmd_display,
+            "argv": argv,
+            "cwd": str(EFFECTIVE_ROOT),
+            "project_mode": PROJECT_ROOT is not None,
+            "project_root": str(PROJECT_ROOT) if PROJECT_ROOT else None,
+            "exit_code": "timeout",
+            "stdout": stdout_structured,
+            "stderr": stderr_norm,
+            "run_id": run_id,
+            "stdout_raw": stdout_raw,
+            "stderr_raw": stderr_raw,
+            "stdout_norm": stdout_structured,
+            "stdout_norm_base": stdout_norm_base,
+            "stderr_norm": stderr_norm,
+            "provider_meta": provider_meta,
+            "normalization_notes": normalization_notes,
+            "extra_args": extra_args,
+            "timeout_seconds": timeout_val,
+            "memory_file": str(memory_file) if memory_file else None,
+            "memory_preview": memory_preview[:500] if memory_preview else "",
+            "sections": sections,
+            "next_actions": next_actions,
+            "delta": delta_lines,
+            "delta_sources": delta_sources,
+            "tags": tags,
+            "cli_version_note": cli_version_note,
+            "workflow_name": workflow_name or None,
+            "workflow_step": workflow_step or None,
+            "parent_session_id": parent_session_id,
+            "parent_session_file": parent_session_file,
+            "session_context_injected": bool(session_context_lines),
+            "session_dir": env.get("CODEX_SESSION_DIR") if provider == "codex" else None,
+        }
+        log_path = write_log(log_entry)
+        artifacts = get_artifacts_touched(EFFECTIVE_ROOT, log_path, [])
+        append_summary(
+            profile,
+            provider,
+            finished,
+            "timeout",
+            stdout_structured,
+            log_path.name,
+            artifacts,
+            next_actions,
+            delta_lines,
+            tags,
+        )
+        if output_format == "json":
+            json_output = {
+                "status": "timeout",
+                "exit_code": 124,
+                "profile": profile,
+                "provider": provider,
+                "run_id": run_id,
+                "timestamp": finished,
+                "sections": sections,
+                "next_actions": next_actions,
+                "delta": delta_lines,
+                "tags": tags,
+                "log_file": str(log_path),
+                "timeout_seconds": timeout_val,
+                "error": f"Command timed out after {timeout_val}s",
+            }
+            print(json.dumps(json_output, indent=2))
+        else:
+            sys.stderr.write(f"Command timed out after {timeout_val}s. Log: {log_path}\n")
+
+        # Phase 11: Check for fallback on timeout
+        original_cfg = profiles[profile] or {}
+        if should_fallback("timeout", original_cfg):
+            fallback_providers = get_fallback_providers(original_cfg)
+            if _fallback_attempt < len(fallback_providers):
+                next_fb = fallback_providers[_fallback_attempt]
+                if not quiet:
+                    print(f"[FALLBACK] Trying provider: {next_fb.get('provider', 'unknown')}", file=sys.stderr)
+                return run_profile(
+                    profile,
+                    extra_args,
+                    timeout,
+                    use_memory,
+                    normalize,
+                    print_mode,
+                    tags,
+                    delta_from_git,
+                    output_format,
+                    continue_session,
+                    quiet,
+                    _fallback_attempt=_fallback_attempt + 1,
+                    _fallback_cfg=next_fb,
+                )
+        return 124
+    except KeyboardInterrupt:
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                out, err = proc.communicate(timeout=2)
+            except Exception:  # noqa: BLE001
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+                out, err = ("", "")
+
+        finished = dt.datetime.now(dt.UTC).isoformat() + "Z"
+        stdout_raw = _text(out) if "out" in locals() else ""
+        stderr_raw = _text(err) if "err" in locals() else ""
+
+        if normalize:
+            stdout_norm_base, stderr_norm, provider_meta, normalization_notes = normalize_output(provider, stdout_raw, stderr_raw)
+        else:
+            stdout_norm_base, stderr_norm = stdout_raw, stderr_raw
+            provider_meta = {
+                "provider": provider,
+                "session_id": None,
+                "model": None,
+                "workdir": None,
+                "banner_removed": False,
+                "normalizer_version": "v2",
+            }
+            normalization_notes = ["normalization disabled"]
+
+        sections, stdout_structured = extract_structured_sections(stdout_norm_base)
+        next_actions = extract_next_actions(sections, stdout_structured)
+
+        # Combine delta from multiple sources
+        delta_sources: List[str] = []
+        delta_lines: List[str] = []
+        output_delta = sections.get("delta", [])
+        if output_delta and any(line.strip() for line in output_delta):
+            delta_lines.extend(output_delta)
+            delta_sources.append("output")
+        computed_delta = compute_delta(previous_snapshot, sections, next_actions)
+        if computed_delta:
+            if delta_lines:
+                delta_lines.append("- Session comparison:")
+            delta_lines.extend(computed_delta)
+            if "output" not in delta_sources:
+                delta_sources.append("computed")
+        if delta_from_git:
+            git_delta_lines, git_delta_sources = get_git_deltas(EFFECTIVE_ROOT)
+            if git_delta_lines:
+                delta_lines.extend(git_delta_lines)
+                delta_sources.extend(git_delta_sources)
+        if not delta_lines:
+            delta_lines = computed_delta if computed_delta else ["- First recorded session for this profile."]
+            if not delta_sources:
+                delta_sources = ["computed"]
+
+        log_entry = {
+            "timestamp_start": started,
+            "timestamp_end": finished,
+            "run_id": run_id,
+            "profile": profile,
+            "provider": provider,
+            "prompt": str(prompt_path),
+            "command": cmd_display,
+            "argv": argv,
+            "cwd": str(EFFECTIVE_ROOT),
+            "project_mode": PROJECT_ROOT is not None,
+            "project_root": str(PROJECT_ROOT) if PROJECT_ROOT else None,
+            "exit_code": "interrupt",
+            "stdout": stdout_structured,
+            "stderr": stderr_norm,
+            "run_id": run_id,
+            "stdout_raw": stdout_raw,
+            "stderr_raw": stderr_raw,
+            "stdout_norm": stdout_structured,
+            "stdout_norm_base": stdout_norm_base,
+            "stderr_norm": stderr_norm,
+            "provider_meta": provider_meta,
+            "normalization_notes": normalization_notes,
+            "extra_args": extra_args,
+            "timeout_seconds": timeout_val,
+            "memory_file": str(memory_file) if memory_file else None,
+            "memory_preview": memory_preview[:500] if memory_preview else "",
+            "sections": sections,
+            "next_actions": next_actions,
+            "delta": delta_lines,
+            "delta_sources": delta_sources,
+            "tags": tags,
+            "cli_version_note": cli_version_note,
+            "workflow_name": workflow_name or None,
+            "workflow_step": workflow_step or None,
+            "parent_session_id": parent_session_id,
+            "parent_session_file": parent_session_file,
+            "session_context_injected": bool(session_context_lines),
+            "session_dir": env.get("CODEX_SESSION_DIR") if provider == "codex" else None,
+        }
+        log_path = write_log(log_entry)
+        artifacts = get_artifacts_touched(EFFECTIVE_ROOT, log_path, [])
+        append_summary(
+            profile,
+            provider,
+            finished,
+            "interrupt",
+            stdout_structured,
+            log_path.name,
+            artifacts,
+            next_actions,
+            delta_lines,
+            tags,
+        )
+        if output_format == "json":
+            json_output = {
+                "status": "interrupted",
+                "exit_code": 130,
+                "profile": profile,
+                "provider": provider,
+                "run_id": run_id,
+                "timestamp": finished,
+                "sections": sections,
+                "next_actions": next_actions,
+                "delta": delta_lines,
+                "tags": tags,
+                "log_file": str(log_path),
+            }
+            print(json.dumps(json_output, indent=2))
+        else:
+            sys.stderr.write(f"Interrupted. Log: {log_path}\n")
+        return 130
+
+
+if __name__ == "__main__":
+    raw_args = sys.argv[1:]
+    forward_args: List[str] = []
+    if "--" in raw_args:
+        idx = raw_args.index("--")
+        forward_args = raw_args[idx + 1 :]
+        raw_args = raw_args[:idx]
+
+    parser = argparse.ArgumentParser(description="AgenticOS unified agent runner")
+    parser.add_argument(
+        "--profile",
+        required=True,
+        help="Profile name from .agents/agents.yaml",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help=f"Seconds before killing the provider command (default: {TIMEOUT_DEFAULT}, env: AGENT_TIMEOUT)",
+    )
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="Skip loading/surfacing project memory file",
+    )
+    parser.add_argument(
+        "--no-normalize",
+        action="store_true",
+        help="Disable provider output normalization",
+    )
+    parser.add_argument(
+        "--print",
+        dest="print_mode",
+        choices=["norm", "raw", "plan", "code", "verification", "next-actions", "summary", "delta", "clean"],
+        default="norm",
+        help="Choose which section to print (default: norm, clean=answer only)",
+    )
+    parser.add_argument(
+        "--tag",
+        help="Comma-separated tags to attach to this session (stored in logs/memory)",
+    )
+    parser.add_argument(
+        "--delta-from-git",
+        action="store_true",
+        help="Append file-name-only deltas from git diff (unstaged and staged), silently skipped if not in a git repo",
+    )
+    parser.add_argument(
+        "--output",
+        dest="output_format",
+        choices=["text", "json"],
+        default="text",
+        help="Output format: text (default) or json for machine-readable output",
+    )
+    parser.add_argument(
+        "--continue",
+        dest="continue_session",
+        nargs="?",
+        const="last",
+        default=None,
+        help="Continue from previous session. Use 'last' (default), a run_id, or log filename",
+    )
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress banners, memory display, and status messages",
+    )
+    args = parser.parse_args(raw_args)
+
+    tag_list = []
+    if args.tag:
+        tag_list = [t.strip() for t in args.tag.split(",") if t.strip()]
+
+    try:
+        code = run_profile(
+            args.profile,
+            forward_args,
+            args.timeout,
+            not args.no_memory,
+            not args.no_normalize,
+            args.print_mode,
+            tag_list,
+            args.delta_from_git,
+            args.output_format,
+            args.continue_session,
+            args.quiet,
+        )
+        sys.exit(code)
+    except Exception as exc:  # pylint: disable=broad-except
+        error_entry = {
+            "timestamp": dt.datetime.now(dt.UTC).isoformat() + "Z",
+            "profile": getattr(args, "profile", "unknown"),
+            "error": str(exc),
+            "cwd": str(EFFECTIVE_ROOT),
+            "project_mode": PROJECT_ROOT is not None,
+            "project_root": str(PROJECT_ROOT) if PROJECT_ROOT else None,
+            "tags": tag_list,
+        }
+        try:
+            write_log(error_entry)
+        except Exception:
+            pass
+        sys.stderr.write(f"ERROR: {exc}\n")
+        sys.exit(1)

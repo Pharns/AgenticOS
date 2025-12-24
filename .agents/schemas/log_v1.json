@@ -1,0 +1,151 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agenticsec.io/schemas/log_v1.json",
+  "title": "AgenticOS Log Entry Schema",
+  "description": "Schema for AgenticOS agent and router execution logs",
+  "type": "object",
+  "properties": {
+    "timestamp_start": {
+      "type": "string",
+      "description": "ISO 8601 timestamp when execution started"
+    },
+    "timestamp_end": {
+      "type": "string",
+      "description": "ISO 8601 timestamp when execution ended"
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique identifier correlating all logs in a single invocation chain"
+    },
+    "profile": {
+      "type": "string",
+      "description": "Agent profile name (dev, grc, research, ops, etc.)"
+    },
+    "provider": {
+      "type": "string",
+      "description": "LLM provider (codex, claude, etc.)"
+    },
+    "prompt": {
+      "type": "string",
+      "description": "Path to prompt file used"
+    },
+    "command": {
+      "type": "string",
+      "description": "CLI command executed"
+    },
+    "argv": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Command arguments array"
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory"
+    },
+    "exit_code": {
+      "type": "integer",
+      "description": "Process exit code"
+    },
+    "stdout": {
+      "type": "string",
+      "description": "Standard output (normalized)"
+    },
+    "stderr": {
+      "type": "string",
+      "description": "Standard error (normalized)"
+    },
+    "stdout_raw": {
+      "type": "string",
+      "description": "Raw standard output"
+    },
+    "stderr_raw": {
+      "type": "string",
+      "description": "Raw standard error"
+    },
+    "stdout_norm": {
+      "type": "string",
+      "description": "Normalized standard output"
+    },
+    "stdout_norm_base": {
+      "type": "string",
+      "description": "Base normalized output before section extraction"
+    },
+    "stderr_norm": {
+      "type": "string",
+      "description": "Normalized standard error"
+    },
+    "provider_meta": {
+      "type": "object",
+      "description": "Provider-specific metadata"
+    },
+    "normalization_notes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Notes about output normalization steps"
+    },
+    "extra_args": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Extra arguments passed"
+    },
+    "timeout_seconds": {
+      "type": "number",
+      "description": "Timeout in seconds"
+    },
+    "memory_file": {
+      "type": ["string", "null"],
+      "description": "Path to memory file"
+    },
+    "memory_preview": {
+      "type": "string",
+      "description": "Preview of memory content"
+    },
+    "sections": {
+      "type": "object",
+      "description": "Extracted sections from output",
+      "properties": {
+        "plan": {"type": "array", "items": {"type": "string"}},
+        "code changes": {"type": "array", "items": {"type": "string"}},
+        "verification": {"type": "array", "items": {"type": "string"}},
+        "next actions": {"type": "array", "items": {"type": "string"}},
+        "delta": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "next_actions": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Extracted next actions"
+    },
+    "delta": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Delta from previous session"
+    },
+    "delta_sources": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Sources of delta information (output, git-unstaged, git-staged)"
+    },
+    "tags": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "Tags for categorization"
+    },
+    "cli_version_note": {
+      "type": ["string", "null"],
+      "description": "CLI version information"
+    },
+    "workflow_name": {
+      "type": ["string", "null"],
+      "description": "Workflow name if running in workflow context"
+    },
+    "workflow_step": {
+      "type": ["string", "null"],
+      "description": "Workflow step name if running in workflow context"
+    },
+    "workflow_context_injected": {
+      "type": "boolean",
+      "description": "Whether workflow context was injected into prompt"
+    }
+  }
+}

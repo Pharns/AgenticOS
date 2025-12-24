@@ -1,0 +1,1332 @@
+#!/usr/bin/env python3
+"""Unified Agent Router for AgenticOS."""
+
+import argparse
+import os
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+VENV_PY = ROOT / ".venv" / "bin" / "python"
+
+
+def generate_run_id() -> str:
+    """Generate a unique run ID for correlation across logs."""
+    return str(uuid.uuid4())
+
+
+# =============================================================================
+# Phase 1: Project Detection
+# =============================================================================
+
+def detect_project(project_path: str | Path | None) -> Tuple[Path | None, Path | None]:
+    """
+    Detect if a project has a .agents/ folder.
+
+    Args:
+        project_path: Path to a project directory (or None to skip detection)
+
+    Returns:
+        Tuple of (project_root, agents_dir) or (None, None) if not found
+    """
+    if project_path is None:
+        return None, None
+
+    project_root = Path(project_path).resolve()
+
+    if not project_root.exists():
+        return None, None
+
+    if not project_root.is_dir():
+        return None, None
+
+    agents_dir = project_root / ".agents"
+
+    if agents_dir.exists() and agents_dir.is_dir():
+        return project_root, agents_dir
+
+    return None, None
+
+
+def get_project_config_paths(agents_dir: Path) -> Dict[str, Path]:
+    """
+    Get paths to project-specific config files.
+
+    Args:
+        agents_dir: Path to project's .agents/ directory
+
+    Returns:
+        Dict with paths to agents.yaml, workflows.yaml, etc.
+    """
+    return {
+        "agents": agents_dir / "agents.yaml",
+        "workflows": agents_dir / "workflows.yaml",
+        "router_rules": agents_dir / "router_auto_rules.json",
+        "prompts": agents_dir / "prompts",
+        "memory": agents_dir / "memory",
+        "logs": agents_dir / "logs",
+    }
+
+
+def validate_project(project_root: Path, agents_dir: Path) -> List[str]:
+    """
+    Validate a project's .agents/ folder structure.
+
+    Args:
+        project_root: Path to project root
+        agents_dir: Path to project's .agents/ directory
+
+    Returns:
+        List of warning messages (empty if all good)
+    """
+    warnings = []
+    configs = get_project_config_paths(agents_dir)
+
+    # Check for agents.yaml (required)
+    if not configs["agents"].exists():
+        warnings.append(f"Missing agents.yaml in {agents_dir}")
+
+    # Check for workflows.yaml (optional)
+    if not configs["workflows"].exists():
+        warnings.append(f"No workflows.yaml in {agents_dir} (optional)")
+
+    # Check for prompts directory
+    if not configs["prompts"].exists():
+        warnings.append(f"No prompts/ directory in {agents_dir}")
+
+    return warnings
+
+if not os.environ.get("VIRTUAL_ENV") and VENV_PY.exists() and Path(sys.executable) != VENV_PY:
+    os.execv(str(VENV_PY), [str(VENV_PY)] + sys.argv)
+
+try:
+    import yaml  # type: ignore
+except ImportError:
+    sys.stderr.write("PyYAML is required. Run ./install.sh or pip install pyyaml.\n")
+    sys.exit(1)
+
+AGENTS_FILE = ROOT / ".agents" / "agents.yaml"
+WORKFLOWS_FILE = ROOT / ".agents" / "workflows.yaml"
+
+
+def load_yaml(path: Path, required: bool = True) -> Dict[str, Any]:
+    if not path.exists():
+        if required:
+            raise FileNotFoundError(f"Missing config: {path}")
+        return {}
+    if not os.access(path, os.R_OK):
+        raise PermissionError(f"Config not readable: {path}")
+    with path.open("r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def load_configs(
+    project_root: Path | None = None,
+    agents_dir: Path | None = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Path, Path]:
+    """
+    Load agents and workflows configs, preferring project-specific if available.
+
+    Args:
+        project_root: Path to project root (or None for default)
+        agents_dir: Path to project's .agents/ directory (or None for default)
+
+    Returns:
+        Tuple of (agents_config, workflows_config, agents_file_path, workflows_file_path)
+    """
+    if agents_dir is not None:
+        configs = get_project_config_paths(agents_dir)
+        agents_file = configs["agents"]
+        workflows_file = configs["workflows"]
+    else:
+        agents_file = AGENTS_FILE
+        workflows_file = WORKFLOWS_FILE
+
+    agents = load_yaml(agents_file, required=True)
+    workflows = load_yaml(workflows_file, required=False)
+
+    return agents, workflows, agents_file, workflows_file
+
+
+def resolve_profile_alias(
+    profile: str,
+    agents_cfg: Dict[str, Any],
+) -> str:
+    """
+    Resolve a profile alias to the actual profile name.
+
+    Aliases can be defined in two ways:
+    1. Global aliases section: aliases: {d: dev, q: quick}
+    2. Per-profile aliases: profiles: {dev: {aliases: [d, development]}}
+
+    Returns the resolved profile name (or original if no alias found).
+    """
+    profiles = agents_cfg.get("profiles", {}) if isinstance(agents_cfg, dict) else {}
+
+    # If it's already a valid profile, return it
+    if profile in profiles:
+        return profile
+
+    # Check global aliases section
+    global_aliases = agents_cfg.get("aliases", {}) if isinstance(agents_cfg, dict) else {}
+    if profile in global_aliases:
+        resolved = global_aliases[profile]
+        if resolved in profiles:
+            return resolved
+
+    # Check per-profile aliases
+    for profile_name, profile_cfg in profiles.items():
+        if not isinstance(profile_cfg, dict):
+            continue
+        profile_aliases = profile_cfg.get("aliases", [])
+        if isinstance(profile_aliases, list) and profile in profile_aliases:
+            return profile_name
+
+    # No alias found, return original
+    return profile
+
+
+def list_targets(
+    agents: Dict[str, Any],
+    workflows: Dict[str, Any],
+    project_root: Path | None = None,
+    agents_dir: Path | None = None,
+    json_output: bool = False,
+) -> int:
+    import json
+
+    profiles = (agents.get("profiles") if isinstance(agents, dict) else {}) or {}
+    wf_map = (workflows.get("workflows") if isinstance(workflows, dict) else {}) or {}
+
+    # Build alias lookup (profile_name -> list of aliases)
+    global_aliases = (agents.get("aliases") if isinstance(agents, dict) else {}) or {}
+    profile_aliases: Dict[str, List[str]] = {}
+    # Add global aliases
+    for alias, target in global_aliases.items():
+        profile_aliases.setdefault(target, []).append(alias)
+    # Add per-profile aliases
+    for name, cfg in profiles.items():
+        if isinstance(cfg, dict):
+            for alias in cfg.get("aliases", []):
+                profile_aliases.setdefault(name, []).append(alias)
+
+    if json_output:
+        output = {
+            "project_root": str(project_root) if project_root else None,
+            "agents_dir": str(agents_dir) if agents_dir else None,
+            "profiles": {
+                name: {
+                    "provider": cfg.get("provider", "unknown"),
+                    "description": cfg.get("description", ""),
+                    "keywords": cfg.get("keywords", []),
+                    "aliases": sorted(set(profile_aliases.get(name, []))),
+                }
+                for name, cfg in profiles.items()
+            },
+            "workflows": {
+                name: {
+                    "description": (cfg or {}).get("description", ""),
+                    "steps": len((cfg or {}).get("steps", [])),
+                }
+                for name, cfg in wf_map.items()
+            },
+        }
+        print(json.dumps(output, indent=2))
+        return 0
+
+    # Show project context if applicable
+    if project_root is not None:
+        print(f"Project: {project_root}")
+        print(f"Config:  {agents_dir}")
+        print()
+
+    print("Profiles:")
+    if profiles:
+        for name, cfg in sorted(profiles.items()):
+            desc = cfg.get("description", "").strip()
+            provider = cfg.get("provider", "unknown")
+            aliases = sorted(set(profile_aliases.get(name, [])))
+            alias_text = f" (aliases: {', '.join(aliases)})" if aliases else ""
+            desc_text = f" — {desc}" if desc else ""
+            print(f"- {name} [{provider}]{alias_text}{desc_text}")
+    else:
+        print("- (none found)")
+
+    print("\nWorkflows:")
+    if wf_map:
+        for name, cfg in sorted(wf_map.items()):
+            desc = (cfg or {}).get("description", "").strip()
+            desc_text = f" — {desc}" if desc else ""
+            print(f"- {name}{desc_text}")
+    else:
+        print("- (none found)")
+    return 0
+
+
+def normalize_extra(extra: List[str]) -> List[str]:
+    if extra and extra[0] == "--":
+        return extra[1:]
+    return extra
+
+
+def ensure_exists(
+    target_type: str,
+    target: str,
+    agents: Dict[str, Any],
+    workflows: Dict[str, Any],
+    agents_file: Path | None = None,
+    workflows_file: Path | None = None,
+) -> None:
+    agents_file = agents_file or AGENTS_FILE
+    workflows_file = workflows_file or WORKFLOWS_FILE
+
+    if target_type == "profile":
+        profiles = agents.get("profiles", {}) if isinstance(agents, dict) else {}
+        if target not in profiles:
+            raise KeyError(f"Profile '{target}' not found in {agents_file}")
+    else:
+        wf_map = workflows.get("workflows", {}) if isinstance(workflows, dict) else {}
+        if target not in wf_map:
+            raise KeyError(f"Workflow '{target}' not found in {workflows_file}")
+
+
+def dispatch_run(
+    target_type: str,
+    target: str,
+    extra: List[str],
+    run_id: str | None = None,
+    project_root: Path | None = None,
+    agents_dir: Path | None = None,
+    continue_session: str | None = None,
+) -> int:
+    script = ROOT / "scripts" / ("agent" if target_type == "profile" else "agent-workflow")
+
+    # Build argv: agent script expects --profile for profiles
+    if target_type == "profile":
+        argv = [str(script), "--profile", target]
+        # Phase 9: Add --continue flag if session continuation requested
+        if continue_session:
+            argv.extend(["--continue", continue_session])
+        argv.extend(normalize_extra(extra))
+    else:
+        # Workflows take positional name
+        argv = [str(script), target] + normalize_extra(extra)
+
+    # Pass run_id and project info via environment
+    env = os.environ.copy()
+    if run_id:
+        env["AGENTICSEC_RUN_ID"] = run_id
+
+    # Pass project context via environment variables
+    if project_root is not None:
+        env["AGENTICOS_PROJECT_ROOT"] = str(project_root)
+    if agents_dir is not None:
+        env["AGENTICOS_PROJECT_AGENTS"] = str(agents_dir)
+
+    # Determine working directory: project root if specified, else AgenticOS root
+    cwd = project_root if project_root else ROOT
+
+    proc = subprocess.run(
+        argv,
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        cwd=cwd,
+        env=env,
+        check=False,
+    )
+    return proc.returncode if proc.returncode is not None else 0
+
+
+# =============================================================================
+# Phase 7: Workflow Orchestration
+# =============================================================================
+
+def execute_workflow(
+    workflow_name: str,
+    workflows: Dict[str, Any],
+    agents: Dict[str, Any],
+    extra: List[str],
+    run_id: str | None = None,
+    project_root: Path | None = None,
+    agents_dir: Path | None = None,
+    step_filter: int | None = None,
+    continue_on_error: bool = False,
+    print_mode: str = "summary",
+    timeout: float | None = None,
+) -> int:
+    """
+    Execute a workflow by running each step's profile sequentially.
+
+    Args:
+        workflow_name: Name of the workflow to execute
+        workflows: Parsed workflows.yaml content
+        agents: Parsed agents.yaml content
+        extra: Extra arguments to pass to each step (the task/query)
+        run_id: Correlation ID for logging
+        project_root: Project root if in project mode
+        agents_dir: Project agents dir if in project mode
+        step_filter: Run only this step number (1-indexed), or None for all
+        continue_on_error: Continue executing steps even if one fails
+        print_mode: Output mode for each step (summary, norm, raw)
+        timeout: Timeout per step in seconds
+
+    Returns:
+        Exit code (0 = all steps succeeded, non-zero = at least one failed)
+    """
+    import datetime as dt
+    import time
+
+    wf_map = workflows.get("workflows", {}) if isinstance(workflows, dict) else {}
+    if workflow_name not in wf_map:
+        print(f"ERROR: Workflow '{workflow_name}' not found")
+        return 1
+
+    wf = wf_map[workflow_name]
+    steps = wf.get("steps", [])
+    description = wf.get("description", "")
+
+    if not steps:
+        print(f"Workflow '{workflow_name}' has no steps defined")
+        return 0
+
+    # Build task query from extra args
+    task_query = " ".join(extra) if extra else ""
+
+    print("=" * 60)
+    print(f"WORKFLOW: {workflow_name}")
+    if description:
+        print(f"Description: {description}")
+    print(f"Steps: {len(steps)}")
+    if task_query:
+        print(f"Task: {task_query}")
+    print("=" * 60)
+
+    # Determine which steps to run
+    steps_to_run = []
+    if step_filter is not None:
+        if step_filter < 1 or step_filter > len(steps):
+            print(f"ERROR: Step {step_filter} out of range (1-{len(steps)})")
+            return 1
+        steps_to_run = [(step_filter, steps[step_filter - 1])]
+    else:
+        steps_to_run = list(enumerate(steps, 1))
+
+    # Track results
+    results = []
+    overall_start = time.perf_counter()
+
+    for step_num, step in steps_to_run:
+        step_name = step.get("name", f"step{step_num}")
+        profile = step.get("profile", "dev")
+        step_desc = step.get("description", "")
+
+        print(f"\n{'─' * 60}")
+        print(f"STEP {step_num}/{len(steps)}: {step_name}")
+        print(f"  Profile: {profile}")
+        if step_desc:
+            print(f"  Description: {step_desc}")
+        print("─" * 60)
+
+        # Build command for this step
+        script = ROOT / "scripts" / "agent"
+        argv = [str(script), "--profile", profile, "--print", print_mode]
+
+        if timeout:
+            argv.extend(["--timeout", str(timeout)])
+
+        # Add the task as extra args
+        if task_query:
+            argv.append("--")
+            argv.append(task_query)
+
+        # Build environment with workflow context
+        env = os.environ.copy()
+        env["WORKFLOW"] = workflow_name
+        env["WORKFLOW_STEP"] = step_name
+        if run_id:
+            env["AGENTICOS_RUN_ID"] = run_id
+        if project_root:
+            env["AGENTICOS_PROJECT_ROOT"] = str(project_root)
+        if agents_dir:
+            env["AGENTICOS_PROJECT_AGENTS"] = str(agents_dir)
+
+        cwd = project_root if project_root else ROOT
+        step_start = time.perf_counter()
+
+        try:
+            proc = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=sys.stdout,
+                stderr=sys.stderr,
+                cwd=cwd,
+                env=env,
+                check=False,
+            )
+            step_code = proc.returncode if proc.returncode is not None else 0
+        except Exception as exc:
+            print(f"ERROR: Step failed with exception: {exc}")
+            step_code = 1
+
+        step_duration = time.perf_counter() - step_start
+        step_status = "OK" if step_code == 0 else "FAILED"
+
+        results.append({
+            "step": step_num,
+            "name": step_name,
+            "profile": profile,
+            "exit_code": step_code,
+            "duration_s": round(step_duration, 2),
+            "status": step_status,
+        })
+
+        print(f"\n[Step {step_num} {step_status}] exit={step_code} duration={step_duration:.1f}s")
+
+        # Handle failure
+        if step_code != 0 and not continue_on_error:
+            print(f"\nWORKFLOW ABORTED: Step {step_num} failed (use --continue-on-error to proceed)")
+            break
+
+    # Print summary
+    overall_duration = time.perf_counter() - overall_start
+    succeeded = sum(1 for r in results if r["exit_code"] == 0)
+    failed = sum(1 for r in results if r["exit_code"] != 0)
+
+    print(f"\n{'=' * 60}")
+    print(f"WORKFLOW COMPLETE: {workflow_name}")
+    print(f"  Steps run: {len(results)}/{len(steps)}")
+    print(f"  Succeeded: {succeeded}")
+    print(f"  Failed: {failed}")
+    print(f"  Total time: {overall_duration:.1f}s")
+    print("=" * 60)
+
+    # Log workflow execution
+    try:
+        log_dir = (agents_dir or ROOT / ".agents") / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = dt.datetime.now(dt.UTC).isoformat().replace(":", "-").replace("+", "-")
+        log_path = log_dir / f"{timestamp}-workflow-{workflow_name}.json"
+
+        import json
+        log_entry = {
+            "log_type": "workflow_execution",  # Distinguish from agent logs
+            "timestamp": dt.datetime.now(dt.UTC).isoformat() + "Z",
+            "workflow": workflow_name,
+            "run_id": run_id,
+            "task": task_query,
+            "steps_total": len(steps),
+            "steps_run": len(results),
+            "succeeded": succeeded,
+            "failed": failed,
+            "duration_s": round(overall_duration, 2),
+            "results": results,
+            "project_root": str(project_root) if project_root else None,
+        }
+        with log_path.open("w", encoding="utf-8") as fh:
+            json.dump(log_entry, fh, indent=2)
+    except Exception:
+        pass  # Don't fail on logging errors
+
+    return 0 if failed == 0 else 1
+
+
+def load_rules() -> Dict[str, Any]:
+    """Load and parse router auto rules from JSON file."""
+    rules_file = ROOT / ".agents" / "router_auto_rules.json"
+    if not rules_file.exists():
+        return {"version": "1.0.0", "rules": []}
+    try:
+        with rules_file.open("r", encoding="utf-8") as fh:
+            import json
+            return json.load(fh)
+    except Exception:
+        return {"version": "1.0.0", "rules": []}
+
+
+def tokenize_query(text: str) -> List[str]:
+    """Extract lowercase tokens from free text. Alphanumeric words only."""
+    import re
+    words = re.findall(r'\b[a-z0-9]+\b', text.lower())
+    return words
+
+
+def newest_log_path() -> Path | None:
+    try:
+        log_dir = ROOT / ".agents" / "logs"
+        if not log_dir.exists():
+            return None
+        logs = sorted(log_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        return logs[0] if logs else None
+    except Exception:
+        return None
+
+
+def match_rule(tokens: List[str], rule: Dict[str, Any]) -> bool:
+    """Check if tokens match a rule. match_all required, match_any optional."""
+    match_all = rule.get("match_all", [])
+    match_any = rule.get("match_any", [])
+
+    # All match_all tokens must be present
+    for required in match_all:
+        if required.lower() not in tokens:
+            return False
+
+    # If match_any specified, at least one must be present
+    if match_any:
+        if not any(keyword.lower() in tokens for keyword in match_any):
+            return False
+
+    return True
+
+
+# =============================================================================
+# Phase 6: Smart Auto-Routing with AI Classification
+# =============================================================================
+
+def smart_classify_query(
+    query: str,
+    profiles: Dict[str, Any],
+    workflows: Dict[str, Any],
+    explain: bool = False,
+    timeout: float = 30.0,
+) -> tuple:
+    """
+    Use AI (Gemini) to classify query and select best profile/workflow.
+
+    Returns:
+        Tuple of (target_type, target_name, reasoning) or (None, None, error_msg)
+    """
+    import subprocess
+    import re
+
+    # Build profile descriptions
+    profile_lines = []
+    for name, cfg in profiles.items():
+        desc = cfg.get("description", "No description")
+        provider = cfg.get("provider", "unknown")
+        profile_lines.append(f"- {name} [{provider}]: {desc}")
+
+    # Build workflow descriptions
+    wf_map = workflows.get("workflows", {}) if isinstance(workflows, dict) else {}
+    workflow_lines = []
+    for name, cfg in wf_map.items():
+        desc = cfg.get("description", "No description")
+        workflow_lines.append(f"- {name}: {desc}")
+
+    profiles_text = "\n".join(profile_lines) if profile_lines else "(none)"
+    workflows_text = "\n".join(workflow_lines) if workflow_lines else "(none)"
+
+    # Build classification prompt - keep it concise for fast response
+    prompt = f"""Select the best profile for this task.
+
+Profiles:
+{profiles_text}
+
+Workflows:
+{workflows_text}
+
+Task: {query}
+
+Reply in 3 lines:
+TYPE: profile OR workflow
+TARGET: name
+REASON: why"""
+
+    if explain:
+        print(f"\n[SMART] Sending query to AI classifier...")
+        print(f"  Query: {query!r}")
+
+    try:
+        import shlex
+        import os as smart_os
+        # Use shell=True to ensure PATH is properly inherited
+        # stdin=DEVNULL prevents blocking if gemini tries to read interactive input
+        cmd = f"gemini -o text {shlex.quote(prompt)}"
+
+        if explain:
+            print(f"  Command: gemini -o text '<prompt>'")
+
+        # Inherit environment but ensure we're not in venv that blocks gemini
+        env = smart_os.environ.copy()
+
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+
+        if result.returncode != 0:
+            return (None, None, f"Gemini exited with code {result.returncode}")
+
+        output = result.stdout.strip()
+        if explain:
+            print(f"  AI Response:\n{output}")
+
+        # Parse response
+        lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+
+        target_type = None
+        target_name = None
+        reason = None
+
+        for line in lines:
+            if line.upper().startswith("TYPE:"):
+                target_type = line.split(":", 1)[1].strip().lower()
+            elif line.upper().startswith("TARGET:"):
+                target_name = line.split(":", 1)[1].strip()
+            elif line.upper().startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+
+        if not target_type or not target_name:
+            # Try fallback parsing for less structured responses
+            type_match = re.search(r'\b(profile|workflow)\b', output.lower())
+            if type_match:
+                target_type = type_match.group(1)
+
+            # Look for profile/workflow names in response
+            all_names = list(profiles.keys()) + list(wf_map.keys())
+            for name in all_names:
+                if name.lower() in output.lower():
+                    target_name = name
+                    break
+
+        if not target_type or not target_name:
+            return (None, None, f"Could not parse AI response: {output[:200]}")
+
+        # Validate target exists
+        if target_type == "profile" and target_name not in profiles:
+            # Try case-insensitive match
+            for pname in profiles:
+                if pname.lower() == target_name.lower():
+                    target_name = pname
+                    break
+            else:
+                return (None, None, f"AI suggested unknown profile: {target_name}")
+
+        if target_type == "workflow" and target_name not in wf_map:
+            for wname in wf_map:
+                if wname.lower() == target_name.lower():
+                    target_name = wname
+                    break
+            else:
+                return (None, None, f"AI suggested unknown workflow: {target_name}")
+
+        return (target_type, target_name, reason or "AI classification")
+
+    except subprocess.TimeoutExpired:
+        return (None, None, f"AI classification timed out after {timeout}s. Try: aos auto \"prompt\" (keyword routing) or check Gemini API status")
+    except FileNotFoundError:
+        return (None, None, "Gemini CLI not found. Install with: npm install -g @anthropic-ai/claude-code")
+    except Exception as exc:
+        return (None, None, f"AI classification error: {exc}. Try keyword routing: aos auto \"prompt\"")
+
+
+def log_auto_route_decision(
+    query: str,
+    tokens: List[str],
+    matched_rule_id: str | None,
+    route_type: str | None,
+    route_target: str | None,
+    source: str,
+    argv: List[str],
+    exit_code: int,
+    duration_ms: int,
+    run_id: str,
+    log_file: str | None = None,
+) -> None:
+    """Log auto-route decision to .agents/logs directory."""
+    import json
+    import datetime as dt
+
+    log_dir = ROOT / ".agents" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = dt.datetime.now(dt.UTC).isoformat().replace(":", "-").replace(".", "-") + "Z"
+    path = log_dir / f"{timestamp}-router-auto.json"
+
+    log_entry = {
+        "timestamp": dt.datetime.now(dt.UTC).isoformat() + "Z",
+        "router_action": "auto",
+        "command": "router auto",
+        "query": query,
+        "tokens": tokens,
+        "matched_rule_id": matched_rule_id,
+        "route": {
+            "type": route_type,
+            "target": route_target,
+            "source": source,
+        } if route_type or route_target else None,
+        "target_type": route_type,
+        "target_name": route_target,
+        "argv": argv,
+        "exit_code": exit_code,
+        "duration_ms": duration_ms,
+        "run_id": run_id,
+        "log_file": log_file,
+    }
+
+    try:
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(log_entry, fh, indent=2)
+    except Exception:
+        pass  # Never block on logging failure
+
+
+def lint_rules() -> int:
+    """Lint router auto rules: validate order, detect unreachable/shadowed rules."""
+    rules_data = load_rules()
+    rules = rules_data.get("rules", [])
+
+    if not rules:
+        print("No rules found in .agents/router_auto_rules.json")
+        return 0
+
+    print(f"Linting {len(rules)} rules from .agents/router_auto_rules.json\n")
+
+    issues = []
+    warnings = []
+
+    # Check for structural issues
+    for idx, rule in enumerate(rules, 1):
+        rule_id = rule.get("id", f"rule_{idx}")
+
+        # Check required fields
+        if "match_all" not in rule:
+            issues.append(f"Rule {idx} ({rule_id}): missing 'match_all' field")
+            continue
+
+        match_all = rule.get("match_all", [])
+        if not match_all or len(match_all) == 0:
+            issues.append(f"Rule {idx} ({rule_id}): 'match_all' is empty")
+
+        if "route" not in rule:
+            issues.append(f"Rule {idx} ({rule_id}): missing 'route' field")
+            continue
+
+        route = rule.get("route", {})
+        if "type" not in route or "target" not in route:
+            issues.append(f"Rule {idx} ({rule_id}): route missing 'type' or 'target'")
+
+    # Check for shadowed/unreachable rules
+    for i in range(len(rules)):
+        rule_i = rules[i]
+        rule_i_id = rule_i.get("id", f"rule_{i+1}")
+        match_all_i = set(k.lower() for k in rule_i.get("match_all", []))
+        match_any_i = set(k.lower() for k in rule_i.get("match_any", []))
+
+        for j in range(i + 1, len(rules)):
+            rule_j = rules[j]
+            rule_j_id = rule_j.get("id", f"rule_{j+1}")
+            match_all_j = set(k.lower() for k in rule_j.get("match_all", []))
+            match_any_j = set(k.lower() for k in rule_j.get("match_any", []))
+
+            # Rule j is shadowed if rule i's requirements are a subset of rule j's
+            # (i.e., anything matching j would also match i, but i comes first)
+            if match_all_i.issubset(match_all_j):
+                # If i has no match_any or i's match_any overlaps with j's
+                if not match_any_i:
+                    # Rule i has broader match (no match_any constraint)
+                    warnings.append(
+                        f"Rule {j+1} ({rule_j_id}) may be shadowed by Rule {i+1} ({rule_i_id}): "
+                        f"Rule {i+1} has subset match_all requirements"
+                    )
+                elif match_any_i and match_any_j and match_any_i.intersection(match_any_j):
+                    warnings.append(
+                        f"Rule {j+1} ({rule_j_id}) may be shadowed by Rule {i+1} ({rule_i_id}): "
+                        f"overlapping match conditions"
+                    )
+
+    # Print results
+    print("=" * 60)
+    print("RULE ORDER:")
+    print("=" * 60)
+    for idx, rule in enumerate(rules, 1):
+        rule_id = rule.get("id", f"rule_{idx}")
+        match_all = rule.get("match_all", [])
+        match_any = rule.get("match_any", [])
+        route = rule.get("route", {})
+        print(f"\n{idx}. {rule_id}")
+        print(f"   match_all: {match_all}")
+        if match_any:
+            print(f"   match_any: {match_any}")
+        print(f"   route: {route.get('type')}/{route.get('target')}")
+
+    if issues:
+        print("\n" + "=" * 60)
+        print("ISSUES FOUND:")
+        print("=" * 60)
+        for issue in issues:
+            print(f"  ✗ {issue}")
+
+    if warnings:
+        print("\n" + "=" * 60)
+        print("WARNINGS:")
+        print("=" * 60)
+        for warning in warnings:
+            print(f"  ⚠ {warning}")
+
+    if not issues and not warnings:
+        print("\n" + "=" * 60)
+        print("✓ No issues or warnings found")
+        print("=" * 60)
+
+    return 1 if issues else 0
+
+
+def auto_route(
+    workflow_flag: str | None,
+    profile_flag: str | None,
+    smart: bool,
+    tasks: List[str] | None,
+    query: List[str],
+    strict: bool,
+    explain: bool,
+    dry_run: bool,
+    lint: bool,
+    extra: List[str],
+    agents: Dict[str, Any],
+    workflows: Dict[str, Any],
+    run_id: str | None = None,
+    argv: List[str] | None = None,
+    project_root: Path | None = None,
+    agents_dir: Path | None = None,
+    smart_timeout: float = 30.0,
+) -> int:
+    """
+    V1 router auto with precedence: --workflow > --profile > --smart > --task > free text.
+    Always prints why. Supports --strict, --explain, --dry-run, --lint, --smart.
+    """
+    import time
+
+    start = time.perf_counter()
+    run_id = run_id or generate_run_id()
+    argv = argv or []
+    log_target_type: str | None = None
+    log_target_name: str | None = None
+    log_rule_id: str | None = None
+    log_source: str = "auto"
+    log_tokens: List[str] = []
+    log_query: str = " ".join(query) if query else ""
+
+    def finish(exit_code: int) -> int:
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        latest_log = newest_log_path()
+        log_file = latest_log.name if latest_log else None
+        try:
+            log_auto_route_decision(
+                log_query,
+                log_tokens,
+                log_rule_id,
+                log_target_type,
+                log_target_name,
+                log_source,
+                argv,
+                exit_code,
+                duration_ms,
+                run_id,
+                log_file=log_file,
+            )
+        except Exception:
+            pass
+        return exit_code
+
+    # Handle --lint mode
+    if lint:
+        return finish(lint_rules())
+
+    # Build query string
+    query_str = " ".join(query) if query else ""
+    log_query = query_str
+
+    # Precedence 1: --workflow (direct specification)
+    if workflow_flag:
+        wf_map = (workflows.get("workflows") if isinstance(workflows, dict) else {}) or {}
+        if workflow_flag not in wf_map:
+            print(f"ERROR: Workflow '{workflow_flag}' not found in workflows.yaml")
+            if explain:
+                print(f"  Available workflows: {list(wf_map.keys())}")
+            log_source = "--workflow (not found)"
+            return finish(1)
+
+        if explain:
+            print(f"ROUTE SOURCE: --workflow flag (precedence 1)")
+            print(f"  Direct specification: {workflow_flag}")
+
+        print(f"MATCHED: workflow '{workflow_flag}'")
+        print(f"  Reason: directly specified via --workflow flag")
+
+        log_target_type = "workflow"
+        log_target_name = workflow_flag
+        log_source = "--workflow"
+
+        if dry_run:
+            print(f"\n[DRY-RUN] Would execute: workflow '{workflow_flag}' with args {extra}")
+            return finish(0)
+
+        rc = dispatch_run("workflow", workflow_flag, extra, run_id=run_id, project_root=project_root, agents_dir=agents_dir)
+        return finish(rc)
+
+    # Precedence 2: --profile (direct specification)
+    if profile_flag:
+        profiles = (agents.get("profiles") if isinstance(agents, dict) else {}) or {}
+        if profile_flag not in profiles:
+            print(f"ERROR: Profile '{profile_flag}' not found in agents.yaml")
+            if explain:
+                print(f"  Available profiles: {list(profiles.keys())}")
+            log_source = "--profile (not found)"
+            return finish(1)
+
+        if explain:
+            print(f"ROUTE SOURCE: --profile flag (precedence 2)")
+            print(f"  Direct specification: {profile_flag}")
+
+        print(f"MATCHED: profile '{profile_flag}'")
+        print(f"  Reason: directly specified via --profile flag")
+
+        log_target_type = "profile"
+        log_target_name = profile_flag
+        log_source = "--profile"
+
+        if dry_run:
+            print(f"\n[DRY-RUN] Would execute: profile '{profile_flag}' with args {extra}")
+            return finish(0)
+
+        rc = dispatch_run("profile", profile_flag, extra, run_id=run_id, project_root=project_root, agents_dir=agents_dir)
+        return finish(rc)
+
+    # Precedence 3: --smart (AI-based classification)
+    if smart:
+        if not query_str:
+            print("ERROR: --smart requires a query. Provide text after the command.")
+            log_source = "--smart (no query)"
+            return finish(2)
+
+        if explain:
+            print(f"ROUTE SOURCE: --smart flag (precedence 3)")
+            print(f"  Using AI to classify query: {query_str!r}")
+
+        profiles = (agents.get("profiles") if isinstance(agents, dict) else {}) or {}
+
+        target_type, target_name, reason = smart_classify_query(
+            query_str,
+            profiles,
+            workflows,
+            explain=explain,
+            timeout=smart_timeout,
+        )
+
+        if target_type is None:
+            print(f"ERROR: Smart routing failed: {reason}")
+            log_source = "--smart (failed)"
+            return finish(1)
+
+        print(f"\nMATCHED: {target_type} '{target_name}'")
+        print(f"  Reason: AI classification - {reason}")
+
+        log_target_type = target_type
+        log_target_name = target_name
+        log_rule_id = "smart-ai"
+        log_source = "--smart"
+
+        if dry_run:
+            print(f"\n[DRY-RUN] Would execute: {target_type} '{target_name}' with args {extra}")
+            return finish(0)
+
+        rc = dispatch_run(target_type, target_name, extra, run_id=run_id, project_root=project_root, agents_dir=agents_dir)
+        return finish(rc)
+
+    # Precedence 4 & 5: --task or free text (rule-based matching)
+    # Build token list from --task flags and/or free text
+    tokens: List[str] = []
+    log_tokens = tokens
+
+    if tasks:
+        # Tokenize each --task value
+        for task in tasks:
+            tokens.extend(tokenize_query(task))
+
+    # In strict mode, require at least one --task
+    if strict:
+        if not tasks:
+            print("ERROR: --strict mode requires at least one --task flag")
+            log_source = "--strict (missing --task)"
+            return finish(2)
+    else:
+        # Non-strict: allow free-text fallback
+        if query_str:
+            tokens.extend(tokenize_query(query_str))
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_tokens = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            unique_tokens.append(t)
+    tokens = unique_tokens
+
+    if explain:
+        if tasks:
+            print(f"ROUTE SOURCE: --task flags (precedence 3)")
+            print(f"  Tasks: {tasks}")
+        else:
+            print(f"ROUTE SOURCE: free text (precedence 4)")
+            print(f"  Query: {query_str!r}")
+        print(f"  Parsed tokens: {tokens}")
+
+    # Load rules
+    rules_data = load_rules()
+    rules = rules_data.get("rules", [])
+
+    if explain:
+        print(f"\nEvaluating {len(rules)} rules (first-match wins):")
+
+    # Evaluate rules in order
+    for idx, rule in enumerate(rules, 1):
+        rule_id = rule.get("id", f"rule_{idx}")
+        match_all = rule.get("match_all", [])
+        match_any = rule.get("match_any", [])
+        route = rule.get("route", {})
+        route_type = route.get("type")
+        route_target = route.get("target")
+
+        if explain:
+            print(f"\n  Rule {idx}: {rule_id}")
+            print(f"    match_all: {match_all}")
+            if match_any:
+                print(f"    match_any: {match_any}")
+
+        matched = match_rule(tokens, rule)
+
+        if explain:
+            if matched:
+                print(f"    Result: MATCH ✓")
+            else:
+                # Explain why it didn't match
+                missing_all = [t for t in match_all if t.lower() not in tokens]
+                if missing_all:
+                    print(f"    Result: NO MATCH (missing required: {missing_all})")
+                elif match_any:
+                    print(f"    Result: NO MATCH (none of match_any found)")
+                else:
+                    print(f"    Result: NO MATCH")
+
+        if matched:
+            # First match wins
+            print(f"\nMATCHED: {route_type} '{route_target}'")
+            print(f"  Reason: rule '{rule_id}' matched")
+            print(f"    match_all: {match_all}")
+            if match_any:
+                print(f"    match_any: {match_any} (any)")
+            print(f"    tokens found: {tokens}")
+
+            log_target_type = route_type
+            log_target_name = route_target
+            log_rule_id = rule_id
+            log_source = "--task or free-text"
+
+            if dry_run:
+                print(f"\n[DRY-RUN] Would execute: {route_type} '{route_target}' with args {extra}")
+                return finish(0)
+
+            rc = dispatch_run(route_type, route_target, extra, run_id=run_id, project_root=project_root, agents_dir=agents_dir)
+            return finish(rc)
+
+    # No match found
+    print(f"\nNO MATCH: No rules matched tokens {tokens}")
+    if explain:
+        print(f"\nAll {len(rules)} rules evaluated, none matched.")
+        print(f"To add a rule, edit .agents/router_auto_rules.json")
+
+    log_source = "no match"
+    return finish(1)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="AgenticOS Unified Agent Router")
+
+    # Global --project flag applies to all subcommands
+    parser.add_argument(
+        "--project", "-p",
+        metavar="PATH",
+        help="Path to a project directory with its own .agents/ config",
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.required = True
+
+    list_parser = subparsers.add_parser("list", help="List profiles and workflows")
+    list_parser.add_argument("--json", action="store_true", help="Output in JSON format")
+
+    run_parser = subparsers.add_parser("run", help="Run a profile or workflow")
+    run_parser.add_argument("--execute", "-x", action="store_true", help="Execute workflow steps sequentially (for workflow: targets)")
+    run_parser.add_argument("--step", type=int, help="Run only this step number (1-indexed, requires --execute)")
+    run_parser.add_argument("--continue-on-error", action="store_true", help="Continue workflow even if a step fails")
+    run_parser.add_argument("--print", dest="print_mode", choices=["summary", "norm", "raw"], default="summary", help="Output mode for workflow steps")
+    run_parser.add_argument("--timeout", type=float, help="Timeout per step in seconds")
+    run_parser.add_argument("--continue", dest="continue_session", nargs="?", const="last", default=None, help="Continue from previous session (use 'last', run_id, or log filename)")
+    run_parser.add_argument("target", help="Profile or workflow name (use workflow:<name> for workflows)")
+    run_parser.add_argument("extra", nargs="*", help="Extra args (task/query) passed to the runner")
+
+    help_parser = subparsers.add_parser("help", help="Show router help")
+    help_parser.add_argument("extra", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+
+    auto_parser = subparsers.add_parser("auto", help="Auto-routing with precedence: --workflow > --profile > --smart > --task > free text")
+    auto_parser.add_argument("--workflow", help="Directly specify workflow name")
+    auto_parser.add_argument("--profile", help="Directly specify profile name")
+    auto_parser.add_argument("--smart", action="store_true", help="Use AI (Gemini) to classify query and select best profile/workflow")
+    auto_parser.add_argument("--timeout", type=float, default=30.0, help="Timeout for AI classification in seconds (default: 30)")
+    auto_parser.add_argument("--task", action="append", dest="tasks", help="Task keyword(s) for rule matching (can be specified multiple times)")
+    auto_parser.add_argument("--strict", action="store_true", help="Require at least one --task, disable free-text fallback (exit 2 if missing, exit 1 on no match)")
+    auto_parser.add_argument("--explain", action="store_true", help="Show token parsing and rule evaluation details")
+    auto_parser.add_argument("--dry-run", action="store_true", help="Print chosen route but do not execute")
+    auto_parser.add_argument("--lint", action="store_true", help="Validate rules and report order issues, unreachable/shadowed rules")
+    auto_parser.add_argument("query", nargs="*", help="Free-text query for token-based routing (fallback if no flags)")
+
+    # Pre-process argv to handle -- separator for auto command
+    # argparse doesn't handle "query -- extra" well, so we split manually
+    argv_to_parse = sys.argv[1:]
+    extra_passthrough: List[str] = []
+
+    if "--" in argv_to_parse:
+        sep_idx = argv_to_parse.index("--")
+        extra_passthrough = argv_to_parse[sep_idx + 1:]
+        argv_to_parse = argv_to_parse[:sep_idx]
+
+    args = parser.parse_args(argv_to_parse)
+    # Attach the passthrough args
+    args.extra = extra_passthrough
+
+    # ==========================================================================
+    # Phase 1: Project Detection
+    # ==========================================================================
+    project_root: Path | None = None
+    agents_dir: Path | None = None
+
+    if args.project:
+        project_root, agents_dir = detect_project(args.project)
+        if project_root is None:
+            sys.stderr.write(f"ERROR: No .agents/ folder found in project: {args.project}\n")
+            sys.stderr.write(f"  Expected: {Path(args.project).resolve() / '.agents'}\n")
+            return 1
+
+        # Validate project structure
+        warnings = validate_project(project_root, agents_dir)
+        for warning in warnings:
+            sys.stderr.write(f"WARNING: {warning}\n")
+
+    # Also check environment variables (set by aos -p)
+    elif os.environ.get("AGENTICOS_PROJECT_ROOT") and os.environ.get("AGENTICOS_PROJECT_AGENTS"):
+        env_root = Path(os.environ["AGENTICOS_PROJECT_ROOT"])
+        env_agents = Path(os.environ["AGENTICOS_PROJECT_AGENTS"])
+        if env_root.exists() and env_agents.exists():
+            project_root = env_root
+            agents_dir = env_agents
+
+    # ==========================================================================
+    # Load configs (project-specific if --project, else default)
+    # ==========================================================================
+    try:
+        agents, workflows, agents_file, workflows_file = load_configs(
+            project_root=project_root,
+            agents_dir=agents_dir,
+        )
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"ERROR: {exc}\n")
+        return 1
+
+    try:
+        if args.command == "list":
+            return list_targets(
+                agents,
+                workflows,
+                project_root=project_root,
+                agents_dir=agents_dir,
+                json_output=args.json,
+            )
+        elif args.command == "run":
+            target_name = args.target
+            if target_name.startswith("workflow:"):
+                target_type = "workflow"
+                target = target_name.split("workflow:", 1)[1].strip()
+            else:
+                target_type = "profile"
+                target = target_name
+                # Resolve profile alias before validation
+                target = resolve_profile_alias(target, agents)
+            ensure_exists(
+                target_type,
+                target,
+                agents,
+                workflows,
+                agents_file=agents_file,
+                workflows_file=workflows_file,
+            )
+            run_id = generate_run_id()
+
+            # Phase 7: Workflow Orchestration
+            # If --execute flag is set and target is a workflow, run all steps
+            if target_type == "workflow" and args.execute:
+                return execute_workflow(
+                    workflow_name=target,
+                    workflows=workflows,
+                    agents=agents,
+                    extra=args.extra,
+                    run_id=run_id,
+                    project_root=project_root,
+                    agents_dir=agents_dir,
+                    step_filter=args.step,
+                    continue_on_error=args.continue_on_error,
+                    print_mode=args.print_mode,
+                    timeout=args.timeout,
+                )
+
+            # Default: dispatch to agent or agent-workflow script
+            return dispatch_run(
+                target_type,
+                target,
+                args.extra,
+                run_id=run_id,
+                project_root=project_root,
+                agents_dir=agents_dir,
+                continue_session=args.continue_session,
+            )
+        elif args.command == "help":
+            parser.print_help()
+            return 0
+        elif args.command == "auto":
+            run_id = generate_run_id()
+            return auto_route(
+                workflow_flag=args.workflow,
+                profile_flag=args.profile,
+                smart=args.smart,
+                tasks=args.tasks,
+                query=args.query,
+                strict=args.strict,
+                explain=args.explain,
+                dry_run=args.dry_run,
+                lint=args.lint,
+                extra=args.extra,
+                agents=agents,
+                workflows=workflows,
+                run_id=run_id,
+                argv=[sys.argv[0]] + sys.argv[1:],
+                project_root=project_root,
+                agents_dir=agents_dir,
+                smart_timeout=args.timeout,
+            )
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"ERROR: {exc}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

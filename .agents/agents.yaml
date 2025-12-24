@@ -1,0 +1,70 @@
+default_profile: dev
+
+# Phase 3: Context Ingestion Configuration (optional - defaults work out of box)
+# When using --project flag, these files are auto-injected into prompts
+context:
+  enabled: true           # Enabled by default in project mode
+  max_chars: 16000        # ~4K tokens max context size
+  files:                  # Files to inject (checked in order, missing files skipped)
+    - README.md
+    - _README.md
+    - CLAUDE.md
+    - AGENTS.md
+
+# Profile aliases for quick access (e.g., ./scripts/agent d → dev)
+aliases:
+  d: dev
+  q: quick
+  g: grc
+  r: research
+  o: ops
+  dc: docs
+
+profiles:
+  dev:
+    description: "Primary development assistant for this repository."
+    keywords: ["code", "implement", "develop", "write", "create"]
+    provider: codex
+    prompt: ".agents/prompts/dev.md"
+    command: 'codex exec --skip-git-repo-check -'
+    memory_file: ".agents/memory/profiles/dev.md"
+
+  grc:
+    description: "GRC and compliance writer for SOC 2, NIST CSF, CPRA, etc."
+    keywords: ["review", "compliance", "grc", "risk", "audit"]
+    provider: claude
+    prompt: ".agents/prompts/grc.md"
+    command: 'claude -p -'
+    memory_file: ".agents/memory/profiles/grc.md"
+
+  research:
+    description: "Deep research, architecture analysis, and market intel."
+    keywords: ["research", "analyze", "investigate", "explore", "find"]
+    provider: claude
+    prompt: ".agents/prompts/research.md"
+    command: 'claude -p -'
+    memory_file: ".agents/memory/profiles/research.md"
+
+  ops:
+    description: "Ops/logs troubleshooting and system diagnostics assistant."
+    keywords: ["ops", "logs", "debug", "troubleshoot", "diagnose"]
+    provider: codex
+    prompt: ".agents/prompts/ops.md"
+    command: 'codex exec --skip-git-repo-check -'
+    memory_file: ".agents/memory/profiles/ops.md"
+
+  quick:
+    description: "Fast brainstorming, drafting, and quick questions via Gemini."
+    keywords: ["quick", "draft", "brainstorm", "idea", "fast"]
+    provider: gemini
+    prompt: ".agents/prompts/quick.md"
+    command: 'gemini'
+    memory_file: ".agents/memory/profiles/quick.md"
+
+  refactor:
+    description: "Advanced code refactoring and multi-file edits via Cursor Agent."
+    keywords: ["refactor", "rewrite", "restructure", "rename", "move"]
+    provider: cursor-agent
+    prompt: ".agents/prompts/refactor.md"
+    command: 'cursor-agent'
+    memory_file: ".agents/memory/profiles/refactor.md"
