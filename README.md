@@ -1,137 +1,139 @@
-# AgenticOS — Cross-Platform Agentic Workflow Template (Ubuntu + macOS)
+# AgenticOS
 
-AgenticOS is a **portable, deterministic, auditable agent operating layer** you can drop into any project. It provides a structured, predictable way to run AI-assisted workflows safely in any environment.
+**Deterministic AI Agent Orchestration Framework**
 
-> **Note:** For the complete, authoritative documentation, please refer to **[[USER_GUIDE.md]]**. This README provides a high-level overview and quick-start guide.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
----
-
-## ✨ Core Features
-
-*   **Authoritative Entry Point:** `scripts/router` acts as the primary, recommended entry point that *decides* which action to take.
-*   **Controlled Execution:** `scripts/agent` is the underlying execution engine that *runs* a specific task, and is documented for advanced or intentional direct usage.
-*   **Declarative Definitions:** Agent profiles are defined in `.agents/agents.yaml` and multi-step sequences in `.agents/workflows.yaml`.
-*   **Structured Logging:** All actions are recorded in machine-readable JSON format under `.agents/logs/`.
-*   **Continuous Validation:** The `scripts/doctor` command ensures system health and enforces operational guarantees.
-*   **Persistent Memory & Deltas:** An optional system at `.agents/memory/` captures and tracks changes across sessions.
+AgenticOS is a portable, auditable AI agent operating layer for running AI-assisted workflows safely. It provides deterministic routing, structured logging, and multi-provider support for security-conscious environments.
 
 ---
 
-## 📚 Documentation
-
-For in-depth technical details, please see the documentation in the `docs/` folder:
-
-*   **[[docs/00-introduction|00 - Introduction to AgenticOS]]**
-*   **[[docs/01-core-commands|01 - Core Commands Reference]]**
-*   **[[docs/02-router-auto-v1|02 - Router Auto (v1)]]**
-*   **[[docs/03-strict-mode|03 - Strict Mode and CI/Automation]]**
-*   **[[docs/04-workflow-memory-delta|04 - Workflow Memory & Delta]]**
-*   **[[docs/05-logging-and-audit|05 - Logging & Auditing]]**
-*   **[[docs/06-doctor-and-validation|06 - Doctor & Validation]]**
-*   **[[docs/07-design-decisions|07 - Design Philosophy]]**
-*   **[[docs/99-roadmap|99 - Roadmap]]**
-
-## Recent Technical Updates
-
-- [Technical Update — 2025-12-12](docs/logs/technical-update-2025-12-12.md)
-
----
-
-## 🚀 Quick Start
-
-### 1. Router-First Quick Start
-
-The `scripts/router` is the recommended and authoritative entry point for most operations.
+## Quick Start
 
 ```bash
-# Use the router to auto-route to a workflow based on a task keyword
-./scripts/router auto --task ops
-```
-
-This command will match the `ops` keyword, route to the `ops_check` workflow, and display the steps. The router decides; the agent executes.
-
-### 2. Install (macOS / Ubuntu supported)
-
-```bash
-cd /path/to/AgenticOS
-chmod +x install.sh
+# Clone and install
+git clone https://github.com/Pharns/AgenticOS.git
+cd AgenticOS
 ./install.sh
-```
-This creates a Python virtual environment (`.venv/`), installs `pyyaml`, and sets execute permissions on the core scripts. Note: You must install your desired LLM provider CLIs (e.g., `codex`, `claude`) separately.
 
-### 3. Launch an Agent or Workflow
+# Verify installation
+./scripts/aos doctor
 
-The `scripts/router` is the recommended entry point for most operations.
-
-```bash
-# Use the router to auto-route to a workflow based on a task keyword
-./scripts/router auto --task ops
-
-# Use the router to explicitly run a profile
-./scripts/router run dev
-```
-
-For advanced use or intentional direct execution, `scripts/agent` remains fully supported:
-
-```bash
-# Directly run a profile (advanced use)
-./scripts/agent --profile dev
-```
-The system will load the appropriate profile, execute the command, and write a session log.
-
-### 4. View a Workflow's Steps
-
-```bash
-# View the steps of a workflow
-./scripts/agent-workflow ops_check
+# Run your first command
+aos q "What is a buffer overflow?"
 ```
 
 ---
 
-## 📁 Folder Structure
+## Features
 
-```text
+- **Unified CLI (`aos`)** — Single command for all operations
+- **Multi-Provider Support** — Claude, Codex, and Gemini
+- **Auto-Routing** — Keyword and AI-powered profile selection
+- **Audit-Grade Logging** — JSON logs for every execution
+- **Health Validation** — 40+ checks with auto-fix capability
+- **Project Isolation** — Per-project configurations
+- **Memory Persistence** — Session continuity across invocations
+
+---
+
+## Usage Examples
+
+```bash
+# Quick questions (Gemini)
+aos q "Explain SQL injection"
+
+# Development tasks (Codex)
+aos d "Fix the authentication bug"
+
+# GRC/Compliance writing (Claude)
+aos g "Draft a password policy for SOC 2"
+
+# Auto-route based on keywords
+aos auto "Write a security policy"        # → grc
+aos auto "Fix the login error"            # → dev
+
+# Work on a specific project
+aos -p myproject d "Add input validation"
+```
+
+---
+
+## Directory Structure
+
+```
 AgenticOS/
-  README.md
-  USER_GUIDE.md
-  install.sh
-
-  scripts/
-    router              # Primary entry point; decides what to run
-    agent               # Execution engine; runs a specific task
-    doctor
-    agent-workflow
-
-  docs/
-    00-introduction.md
-    ...
-
-  .agents/
-    agents.yaml
-    workflows.yaml
-    router_auto_rules.json
-    prompts/
-    logs/
-    memory/
+├── scripts/
+│   ├── aos              # Unified CLI (start here)
+│   ├── router           # Routing engine
+│   ├── agent            # Execution engine
+│   ├── doctor           # Health validation
+│   └── memory           # Memory management
+├── .agents/
+│   ├── agents.yaml      # Profile definitions
+│   ├── workflows.yaml   # Workflow definitions
+│   ├── router_auto_rules.json
+│   ├── prompts/         # System prompts
+│   ├── logs/            # Execution logs
+│   └── memory/          # Persistent memory
+├── docs/                # Documentation
+└── install.sh           # Installer
 ```
 
-This folder can be used directly, copied into any repository, or configured as a GitHub template.
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [User Guide](USER_GUIDE.md) | Complete reference |
+| [Quick Start](docs/aos-quickstart.md) | Get started in 5 minutes |
+| [Core Commands](docs/01-core-commands.md) | Command reference |
+| [Auto-Routing](docs/02-router-auto-v1.md) | Routing system details |
+| [Design Philosophy](docs/07-design-decisions.md) | Why AgenticOS works this way |
 
 ---
 
-## 🛡 Security & Threat Model
+## Requirements
 
-Inspired by Daniel Miessler:
-
-*   AgenticOS **never auto-executes generated code**.
-*   Only user-triggered shell commands run.
-*   Command templates are explicit and human-reviewed.
-*   No hardcoded secrets are stored anywhere.
-*   `.agents/logs/` is **gitignored** by default.
-*   Safe for use inside professional or regulated environments.
+- Python 3.10+
+- At least one AI provider CLI:
+  - `claude` (Anthropic)
+  - `codex` (OpenAI)
+  - `gemini` (Google)
 
 ---
 
-## ✔️ Status
+## Security Model
 
-This README reflects the **final, correct, production-ready** overview for AgenticOS. For detailed contracts and behavior, see **[[USER_GUIDE.md]]**.
+- **No auto-execution** — Generated code is never auto-executed
+- **User-triggered only** — Only explicit commands run
+- **No secrets in repo** — Credentials in `.env` (gitignored)
+- **Full audit trail** — Every action logged with context
+- **Deterministic** — Same inputs produce same behavior
+
+---
+
+## Design Philosophy
+
+AgenticOS chooses:
+
+- Explicit contracts over intelligence
+- Ordered rules over scoring
+- Determinism over convenience
+- Boring correctness over novelty
+
+**If behavior is unclear, AgenticOS will fail or explain — never guess.**
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
+
+---
+
+## Author
+
+**Pharns Génécé** — [Portfolio](https://portfolio.pharns.com) · [GitHub](https://github.com/Pharns) · [LinkedIn](https://linkedin.com/in/pharns)
